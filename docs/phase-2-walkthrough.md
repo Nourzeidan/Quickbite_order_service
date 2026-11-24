@@ -301,6 +301,17 @@ Place an online order first (body as in Phase 1, `paymentMethod: "online"`), not
 
 Reset the timeouts after 14–16.
 
+### 5.3b Kashier unreachable — automated (2026-11-24)
+
+`npx tsx play/kashier-down-e2e.ts` (20 checks, ~1 min; needs core-service, not your API). It starts a **fake Kashier** inside the test and a second order-service API on port 4101 (and later a worker) with `KASHIER_BASE_URL` / `KASHIER_FEP_BASE_URL` pointed at it, so the real sandbox is never called. The fake can drop the connection, never answer, answer 500 / 400, or answer normally, and it counts every request — which is how the suite proves the retry rules:
+
+| Kashier call | network error / 5xx / timeout | 4xx | why |
+|---|---|---|---|
+| create session (`init`) | **3 tries**, then 503 | 1 try, 502 | creating a second session is harmless (the webhook matches by merchantOrderId) |
+| refund | **1 try**, 503, row stays `pending` | 1 try, 502, row `failed` | a timed-out refund may have gone through: a retry could refund twice. The webhook or a human decides. |
+
+Also proven: a 503 is never stored by the idempotency middleware (same key works once Kashier is back); an admin retry of a refund with the same key returns the same refund without calling Kashier; a late refund webhook still settles a refund that "failed" with a network error; the automatic refund of a rejected order is sent after the response; the sweep alerts on it and never re-sends it.
+
 ### 5.4 Real sandbox payment (settles the open questions)
 
 1. Place an online order, `POST /payments/init`, open `redirectUrl` in a browser.
