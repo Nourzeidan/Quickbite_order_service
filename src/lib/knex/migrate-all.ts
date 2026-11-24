@@ -1,7 +1,7 @@
 // Runs knex migrations on every shard of a cluster, one region at a time.
 //   tsx src/lib/knex/migrate-all.ts latest              -> every hot shard
 //   tsx src/lib/knex/migrate-all.ts rollback            -> last batch on every hot shard
-//   tsx src/lib/knex/migrate-all.ts latest --archive    -> every archive shard (Phase 7)
+//   tsx src/lib/knex/migrate-all.ts latest --archive    -> every archive shard (Phase 5)
 //   REGION=eg tsx src/lib/knex/migrate-all.ts latest    -> only eg
 // Stops at the first failing shard so shards never drift silently.
 import knex from "knex";

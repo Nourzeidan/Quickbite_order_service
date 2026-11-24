@@ -44,7 +44,8 @@ flowchart LR
 
     subgraph order-service [order-service (stateless, N instances per region)]
       OS[HTTP API + socket.io + core-events consumer]
-      AW[archival worker - Phase 7]
+      AW[worker - offers, sweeps, partitions, cleanup]
+      AR[archiver - nightly archival]
     end
 
     OS -- sync HTTP (branch, address, products, permissions, reserveStock) --> CS[core-service]
@@ -58,15 +59,19 @@ flowchart LR
     OS --> PGEG[(PG eg — hot)]
     OS --> PGKSA[(PG ksa — hot)]
     AW --> PGEG & PGKSA
-    AW --> ARC[(PG archive per region)]
+    AR --> PGEG & PGKSA
+    AR --> ARC[(PG archive per region)]
+    OS -. prior-year reads .-> ARC
 ```
 
-One codebase, two processes:
+One codebase, three processes:
 
-- `src/server.ts` — Express API, socket.io server on the same HTTP server, the RabbitMQ `core-events` consumer, and the light in-process loops added by later phases: payment-expiry sweep (Phase 2), assignment-timeout scan (Phase 3), presence reconciliation (Phase 4). Each loop uses `FOR UPDATE SKIP LOCKED` or an atomic conditional update, so running N instances is safe.
-- `src/worker.ts` (Phase 7) — the nightly archival worker. Kept separate because it moves bulk data.
+- `src/server.ts` — Express API, socket.io server on the same HTTP server, the RabbitMQ `core-events` consumer. Serves requests only.
+- `src/worker.ts` (`npm run worker`) — every background job: the delivery offer job (every 10 s: take back stale tasks, offer ready orders to the nearest agents, prune presence), the payment / refund sweep, partition maintenance, idempotency cleanup. Each job uses `FOR UPDATE SKIP LOCKED`, conditional updates or advisory locks, so running N workers is safe. It emits WebSocket events through `@socket.io/redis-emitter` (same Redis channel as the API's adapter).
 
-Both are stateless; all state lives in PostgreSQL, Redis and RabbitMQ.
+- `src/archiver.ts` (`npm run archiver`) — archival only (Phase 5, business-logic/archival.md). Its own process on purpose: the worker's jobs are short and time-critical, archival is long, heavy and never urgent, so it gets its own pools and event loop and never delays an offer. One archiver per region at a time (advisory lock). `npm run archive:once` runs one pass now.
+
+All three are stateless; all state lives in PostgreSQL, Redis and RabbitMQ.
 
 Request pipeline (same shape as core-service):
 
@@ -100,12 +105,12 @@ A customer in Egypt orders from an Egyptian branch, delivered by an Egyptian age
 
 ```ts
 db(region: string): Knex;           // hot cluster pool for the region (lazy, cached); throws on unknown region
-dbArchive(region: string): Knex;    // archive cluster pool (Phase 7)
+dbArchive(region: string): Knex;    // archive cluster pool (Phase 5)
 pingAll(): Promise<ShardPing[]>;    // health
 destroyAll(): Promise<void>;        // graceful shutdown
 ```
 
-- Built from env: `REGIONS=eg,ksa` and, per region, `DB_<region>_HOST|PORT|USERNAME|PASSWORD|NAME` (+ `ARCHIVE_DB_<region>_*`, optional until Phase 7). One Knex pool per region and cluster, `DB_POOL_MAX` per pool.
+- Built from env: `REGIONS=eg,ksa` and, per region, `DB_<region>_HOST|PORT|USERNAME|PASSWORD|NAME` (+ `ARCHIVE_DB_<region>_*`, required since Phase 5). One Knex pool per region and cluster, `DB_POOL_MAX` per pool.
 - `resolveRegion` (global middleware) reads **only the `X-Region` header**. A value that is not a configured region (or `all`) → 400 `Invalid region`. Region is **not** a JWT claim, path segment, query param or cookie.
 - `requireRegion()` (per route) → 400 `Region not resolved` when missing; `requireRegion({ allowAll: true })` accepts `all` (admin fan-out reads only). Writes always resolve to one concrete region.
 - **`POST /orders`**: if `X-Region` is absent, the service derives the region from the chosen branch's `countryCode` (cached branch metadata from core). If it is present and differs from the branch's country → 409 `Region mismatch`. An order can never land on the wrong shard.
@@ -124,7 +129,7 @@ Admin global views only, never in the hot path. The controller runs the same pag
 ### 3.5 What lives outside the shard key
 
 - `payment_providers` — tiny lookup, **replicated** to every shard by its seed migration (same rows everywhere).
-- Migrations — the same files run against every hot shard (and every archive shard from Phase 7).
+- Migrations — the same files run against every hot shard (and every archive shard from Phase 5).
 - The Kashier merchant account — one tenant (or one per region, depending on the Kashier contract).
 
 ### 3.6 Adding a region
@@ -172,11 +177,11 @@ Serves `GET /orders/:publicId` (tracking polls). One key per order, shared by ev
 
 | Key | Content | Updated by |
 |---|---|---|
-| `presence:geo:<region>` | GEO set of online agents | online / offline / ping |
-| `presence:busy:<region>` | set of agents with an active delivery | assignment, delivered, cancel |
-| `presence:meta:<region>:<agentId>` | last_seen_at, online flag | online / offline / ping |
+| `presence:geo:<region>` | GEO set: agent → last ping position | online / ping; removed on offline / by the worker |
+| `presence:seen:<region>` | sorted set: agent → last ping time | online / ping; pruned after 5 min |
+| `offers:<region>:<publicId>` / `declined:…` | who has / refused an offer | offer worker, accept, decline |
 
-Auto-assignment reads the GEO set; `agent_presence` (Postgres + GIST) is the source of truth and the fallback when Redis is cold.
+Presence is Redis-only (no table): it is ephemeral and rebuilt by pings within ~30 s. Agents are never auto-assigned — the worker offers orders to the nearest fresh agents and the agent accepts (deliveries.md). "Busy" is read from `orders`, never cached.
 
 ### Layer E — socket.io fan-out
 
@@ -263,7 +268,7 @@ Kashier v3 Payment Sessions + server webhooks. An online order is created in `pe
 
 ## 8. Realtime
 
-socket.io on the same HTTP server, path `/ws`. Handshake auth with `auth.token` or the `access_token` cookie (no query-string tokens — they leak into logs). Rooms = channels: `customer:<userId>`, `restaurant:<restaurantId>`, `branch:<branchId>`, `agent:<agentId>`. Clients `subscribe` to rooms they are permitted to join. Services emit after commit via `io.to(room).emit(event, payload)`; the Redis adapter fans out across instances. The scaffold exists from Phase 0; events are wired in Phase 6. Details: [business-logic/realtime.md](./business-logic/realtime.md).
+socket.io on the same HTTP server, path `/ws`. Handshake auth with `auth.token` or the `access_token` cookie (no query-string tokens — they leak into logs). Rooms = channels: `customer:<userId>`, `restaurant:<restaurantId>`, `branch:<branchId>`, `agent:<agentId>`. Clients `subscribe` to rooms they are permitted to join. Services emit after commit via `io.to(room).emit(event, payload)`; the Redis adapter fans out across instances. The scaffold exists from Phase 0; every phase emits its own events (`WsPublisher`; the worker via a Redis emitter). Details: [business-logic/realtime.md](./business-logic/realtime.md).
 
 ## 9. Strong consistency for money
 
@@ -286,11 +291,11 @@ All money paths run in one transaction on one shard and lock the balance row fir
 PRD: only the **current year** is queryable from the hot DB; older data moves to other storage.
 
 1. A separate Postgres **archive cluster per region** (`order_service_archive_<region>`) runs the same migrations.
-2. A nightly archival worker (Phase 7, `src/worker.ts`) copies prior-year rows in batches (orders with their items, sessions, transactions, deliveries, earnings), verifies counts, then deletes them from hot — per region, idempotent per batch.
-3. Customer/restaurant/agent reads take `year=YYYY` (or a date range): current year → `db(region)`, older → `dbArchive(region)`. Same repositories, different connection.
+2. The archiver process (Phase 5, `src/archiver.ts`) copies prior-year, finished orders in batches (with their items, sessions, transactions, earnings), verifies the archive holds identical rows, then deletes them from hot under a lock-and-compare guard — per region, idempotent per batch. Payouts and webhook events move by date; emptied month partitions are dropped. Details: [business-logic/archival.md](business-logic/archival.md).
+3. Customer/restaurant/agent reads take `year=YYYY` (or a date range): current year → `db(region)`; a range touching a prior year → `dbArchive(region)` **and** `db(region)`, merged with one cursor per source (a prior-year order can still be hot during its 30-day grace). Same repositories, different connections (`lib/knex/read-sources.ts`).
 4. Restaurant balances are not archived (they are running totals).
 
-Until Phase 7 all list queries are bounded by `created_at >= <Jan 1 of the year>` so index range scans stay small.
+All list queries stay bounded (one year at most) so index range scans stay small.
 
 ## 11. Capacity & performance
 

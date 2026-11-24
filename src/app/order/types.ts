@@ -11,6 +11,8 @@ export interface InsertOrderInput {
     deliveryLat: number;
     deliveryLng: number;
     deliveryAddressText: string;
+    pickupLat: number;
+    pickupLng: number;
     status: OrderStatus;
     subtotal: number;
     deliveryFee: number;
@@ -60,6 +62,15 @@ export interface OrderListFilter {
     branchId?: number;
     restaurantId?: number;          // residual filter: scopes restaurant users to their restaurant
     status?: OrderStatus;
+    deliveryAgentId?: number;       // Q-O6: an agent's tasks
+}
+
+// lat/lng rectangle (bounding box of a radius)
+export interface GeoBox {
+    minLat: number;
+    maxLat: number;
+    minLng: number;
+    maxLng: number;
 }
 
 export interface PricedItem {

@@ -6,8 +6,8 @@ Guidelines for anyone (human or AI) working in this repository. Read this first,
 
 QuickBite **order-service**: orders, payments (Kashier v3 + COD), the money ledger (`transactions`), restaurant balances & payouts, deliveries, agent presence & earnings, and realtime updates (socket.io). Sibling of `../core-service`, which owns users, auth/JWT, restaurants, branches, RBAC catalog, products and stock.
 
-- Database: PostgreSQL, **one cluster per country** (shard key column/identifier = `region`: `eg`, `ksa`, …), identical schema on every shard. A cold **archive cluster per region** holds prior-year rows (Phase 7).
-- Redis: cache, idempotency, agent presence (GEO), socket.io adapter, core-event dedupe.
+- Database: PostgreSQL, **one cluster per country** (shard key column/identifier = `region`: `eg`, `ksa`, …), identical schema on every shard. A cold **archive cluster per region** holds prior-year rows (Phase 5).
+- Redis: cache, idempotency, **agent presence** (GEO + last-seen sorted set, no table; nearest agent = `GEOSEARCH` from the branch, seen in the last 5 minutes), socket.io adapter, core-event dedupe.
 - RabbitMQ: **inbound only** (core → order cache/authorization invalidation). This service publishes nothing to the broker in this milestone.
 - Analytics, DevOps, read replicas, incentives/promo codes are **out of scope**.
 
@@ -34,11 +34,14 @@ Additions for this service: `socket.io`, `@socket.io/redis-adapter`, `amqplib` +
 
 ```bash
 npm run dev                         # API + socket.io + core-events consumer (tsx watch src/server.ts)
+npm run worker                      # background jobs: delivery offers, payment/refund sweep, partitions, cleanup (tsx watch src/worker.ts)
+npm run archiver                    # archival process: nightly, prior-year rows hot -> archive (tsx watch src/archiver.ts)
+npm run archive:once                # one archival pass now, ignoring the night window, then exit
 npm run build                       # tsc
 npm run typecheck                   # tsc --noEmit
 npm run migrate                     # latest on EVERY hot shard (REGION=eg limits to one)
 npm run migrate:rollback
-npm run migrate:archive             # latest on every archive shard (Phase 7)
+npm run migrate:archive             # latest on every archive shard
 npm run migrate:make -- <name>
 npm run format | lint               # prettier
 ```
@@ -91,7 +94,7 @@ Request flow: `Route → correlationId → resolveRegion → authenticate → re
 | Permissions | `order:<resource>` + action (core uses `core:<resource>`) | `order:order` / `accept` |
 | WS events | `<aggregate>.<past_tense>` | `order.status_changed` |
 | Redis keys | region-prefixed for shard data | `eg:GET:/api/restaurant/orders?...` |
-| Tables / columns | snake_case plural / snake_case, `is_` booleans, `<verb>_at` timestamps | `agent_presence.last_seen_at` |
+| Tables / columns | snake_case plural / snake_case, `is_` booleans, `<verb>_at` timestamps | `orders.picked_at`, `payment_sessions.expires_at` |
 | Constraints / indexes | `fk_<table>_<col>`, `uq_<table>_<cols>`, `idx_<table>_<cols>`, `idx_<table>_<col>_gist` | `idx_orders_branch_status_created_at` |
 | Migrations | `<timestamp>_create_<table>_table.ts`, raw SQL via `knex.raw`, real `down()` | |
 
@@ -130,7 +133,8 @@ Peak ~620 RPS, 85% reads; hot writes (order insert, payment status update) < 200
 
 ## Working process
 
-- Build in the order of [docs/implementation-plan.md](docs/implementation-plan.md): Phase 0 scaffold → 1 Orders → 2 Payments → 3 Deliveries → 4 Agents → 5 Restaurant finance → 6 WebSocket wiring → 7 Archival. One module end-to-end before the next.
+- Build in the order of [docs/implementation-plan.md](docs/implementation-plan.md): Phase 0 scaffold → 1 Orders → 2 Payments → 3 Deliveries & agents → 4 Restaurant finance → 5 Archival. One module end-to-end before the next.
+- **Realtime ships with each phase**: a phase isn't done until its WebSocket events (realtime.md §5) are emitted after commit through `WsPublisher` and tested.
 - Inside a module: **migration → enums/errors → entity → request DTO → response DTO → repository → service → controller → routes → DI → mount → manual smoke test**.
 - Each phase lists the core-service changes it depends on; don't start a phase until they exist.
 - Use the PR checklist at the end of the implementation plan.

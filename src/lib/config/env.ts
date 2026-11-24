@@ -37,6 +37,40 @@ const envSchema = z.object({
     SERVICE_FEE_BPS: z.string().default("0"),
     CUSTOMER_CANCEL_WINDOW_SEC: z.string().default("60"),
 
+    // Kashier v3 (Phase 2)
+    KASHIER_BASE_URL: z.string().default("https://test-api.kashier.io"),
+    KASHIER_FEP_BASE_URL: z.string().default("https://test-fep.kashier.io"),
+    KASHIER_MERCHANT_ID: z.string().min(1),
+    KASHIER_SECRET_KEY: z.string().min(1),
+    KASHIER_API_KEY: z.string().min(1),
+    KASHIER_WEBHOOK_SECRET: z.string().min(1),
+    KASHIER_RETURN_URL: z.string().min(1),
+    KASHIER_WEBHOOK_URL: z.string().min(1),
+    KASHIER_TIMEOUT_MS: z.string().default("5000"),
+    KASHIER_WEBHOOK_AMOUNT_UNIT: z.enum(["major", "minor"]).default("major"),
+    PAYMENT_SESSION_TIMEOUT_MIN: z.string().default("15"),
+    PAYMENT_SWEEP_INTERVAL_SEC: z.string().default("60"),
+    PAYMENT_SWEEP_GRACE_MIN: z.string().default("3"),
+    REFUND_STALE_ALERT_MIN: z.string().default("60"),
+
+    // deliveries & agents (Phase 3)
+    OFFER_INTERVAL_SEC: z.string().default("10"),
+    OFFER_TOP_N: z.string().default("3"),
+    OFFER_TTL_SEC: z.string().default("60"),
+    OFFER_BATCH: z.string().default("100"),
+    ASSIGNMENT_RADIUS_METERS: z.string().default("5000"),
+    AGENT_STALE_SEC: z.string().default("300"),
+    AGENT_SHARE_BPS: z.string().default("8000"),
+
+    // archival (Phase 5) — read by the archiver process (npm run archiver), docs/business-logic/archival.md §9
+    ARCHIVE_INTERVAL_MIN: z.string().default("60"),
+    ARCHIVE_WINDOW_UTC: z.string().regex(/^\d{1,2}-\d{1,2}$/).default("0-5"),   // "<from>-<to>" hours, to exclusive; 0-24 = always
+    ARCHIVE_BATCH_SIZE: z.string().default("500"),
+    ARCHIVE_MAX_BATCHES_PER_RUN: z.string().default("200"),
+    ARCHIVE_MIN_AGE_DAYS: z.string().default("30"),
+    ARCHIVE_STUCK_ALERT_DAYS: z.string().default("60"),
+    ARCHIVE_TEST_PAUSE_MS: z.string().default("0"),   // dev/test only: pause between copy and delete (race test); ignored in production
+
     WS_HEARTBEAT_SEC: z.string().default("30")
 });
 
@@ -88,11 +122,12 @@ for(const region of regions){
     }
     hotShards[region] = hot;
 
-    // archive clusters are optional until Phase 7
+    // every region has an archive cluster for prior-year rows (Phase 5, archival.md §8)
     const archive = readShardConfig(region, "ARCHIVE_DB");
-    if(archive){
-        archiveShards[region] = archive;
+    if(!archive){
+        throw new Error(`Missing ARCHIVE_DB env for region "${region}" (ARCHIVE_DB_${region}_HOST, ...)`);
     }
+    archiveShards[region] = archive;
 }
 
 export const env = {
@@ -140,7 +175,52 @@ export const env = {
         serviceFeeBps: Number(parsed.SERVICE_FEE_BPS),
         customerCancelWindowSec: Number(parsed.CUSTOMER_CANCEL_WINDOW_SEC),
     },
+    kashier: {
+        baseUrl: parsed.KASHIER_BASE_URL.replace(/\/+$/, ""),
+        fepBaseUrl: parsed.KASHIER_FEP_BASE_URL.replace(/\/+$/, ""),
+        merchantId: parsed.KASHIER_MERCHANT_ID,
+        secretKey: parsed.KASHIER_SECRET_KEY,
+        apiKey: parsed.KASHIER_API_KEY,
+        webhookSecret: parsed.KASHIER_WEBHOOK_SECRET,
+        returnUrl: parsed.KASHIER_RETURN_URL,
+        webhookUrl: parsed.KASHIER_WEBHOOK_URL,
+        timeoutMs: Number(parsed.KASHIER_TIMEOUT_MS),
+        webhookAmountUnit: parsed.KASHIER_WEBHOOK_AMOUNT_UNIT,
+    },
+    payments: {
+        sessionTimeoutMin: Number(parsed.PAYMENT_SESSION_TIMEOUT_MIN),
+        sweepIntervalSec: Number(parsed.PAYMENT_SWEEP_INTERVAL_SEC),
+        sweepGraceMin: Number(parsed.PAYMENT_SWEEP_GRACE_MIN),
+        refundStaleAlertMin: Number(parsed.REFUND_STALE_ALERT_MIN),
+    },
+    delivery: {
+        offerIntervalSec: Number(parsed.OFFER_INTERVAL_SEC),
+        offerTopN: Number(parsed.OFFER_TOP_N),
+        offerTtlSec: Number(parsed.OFFER_TTL_SEC),
+        offerBatch: Number(parsed.OFFER_BATCH),
+        radiusMeters: Number(parsed.ASSIGNMENT_RADIUS_METERS),
+        agentStaleSec: Number(parsed.AGENT_STALE_SEC),
+        agentShareBps: Number(parsed.AGENT_SHARE_BPS),
+    },
+    archival: {
+        intervalMin: Number(parsed.ARCHIVE_INTERVAL_MIN),
+        windowUtc: parseWindow(parsed.ARCHIVE_WINDOW_UTC),
+        batchSize: Number(parsed.ARCHIVE_BATCH_SIZE),
+        maxBatchesPerRun: Number(parsed.ARCHIVE_MAX_BATCHES_PER_RUN),
+        minAgeDays: Number(parsed.ARCHIVE_MIN_AGE_DAYS),
+        stuckAlertDays: Number(parsed.ARCHIVE_STUCK_ALERT_DAYS),
+        testPauseMs: parsed.NODE_ENV === "production" ? 0 : Number(parsed.ARCHIVE_TEST_PAUSE_MS),
+    },
     ws: {
         heartbeatSec: Number(parsed.WS_HEARTBEAT_SEC),
     }
 };
+
+// "0-5" -> {fromHour: 0, toHour: 5}: the archiver works while fromHour <= UTC hour < toHour
+function parseWindow(raw: string): {fromHour: number; toHour: number} {
+    const [fromHour, toHour] = raw.split("-").map(Number) as [number, number];
+    if(fromHour < 0 || toHour > 24 || fromHour >= toHour){
+        throw new Error(`ARCHIVE_WINDOW_UTC "${raw}" must be "<from>-<to>" with 0 <= from < to <= 24`);
+    }
+    return {fromHour, toHour};
+}

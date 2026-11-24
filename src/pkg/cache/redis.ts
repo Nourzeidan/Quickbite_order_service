@@ -48,6 +48,11 @@ export class RedisCacheProvider implements ICacheProvider {
         }
     }
 
+    async delMany(keys: string[]): Promise<number> {
+        if(keys.length === 0) return 0;
+        return this.client.del(...keys);
+    }
+
     async del(key: string): Promise<number> {
         return this.client.del(key);
     }

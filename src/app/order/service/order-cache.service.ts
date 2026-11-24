@@ -54,6 +54,16 @@ export class OrderCacheService {
         return {order, items};
     }
 
+    // many orders, ONE Redis DEL (sweeps, worker batches). Call AFTER commit.
+    invalidateMany = async (orders: {region: string; publicId: string}[]): Promise<void> => {
+        if(orders.length === 0) return;
+        try{
+            await this.cacheProvider.delMany(orders.map((order) => orderCacheKey(order.region, order.publicId)));
+        }catch(err){
+            logger.warn("order cache invalidation failed", {orders: orders.length, error: (err as Error).message});
+        }
+    }
+
     // call AFTER the change is committed
     invalidate = async (region: string, publicId: string): Promise<void> => {
         try{
@@ -65,6 +75,7 @@ export class OrderCacheService {
     }
 }
 
+// note: kept outside the class so batch callers build the same keys
 function orderCacheKey(region: string, publicId: string): string {
     return `${region}:order:${publicId}`;
 }

@@ -37,14 +37,16 @@ coreClient.request<T>({ method, path, body?, correlationId?, idempotencyKey? }):
 
 | Wrapper | Core endpoint | Phase | Returns |
 |---|---|---|---|
-| `branch.client.getBranch` | `GET /api/internal/branches/:id` | 1 | `{ id, restaurantId, countryCode, currency, lat, lng, isActive, acceptOrders, deliveryFee, commission, deliveryRadiusKm }` |
-| `restaurant.client.getRestaurant` | `GET /api/internal/restaurants/:id` | 1 | `{ id, ownerId, name, status }` |
+| `branch.client.getBranches` / `getBranch` | `GET /api/internal/branches?ids=1,2,3` | 1 | `[{ id, restaurantId, countryCode, currency, lat, lng, isActive, acceptOrders, deliveryFee, commission, deliveryRadiusKm }]` |
+| `restaurant.client.getRestaurants` / `getRestaurant` | `GET /api/internal/restaurants?ids=1,2,3` | 1 | `[{ id, ownerId, name, status }]` |
 | `address.client.getAddress` | `GET /api/internal/customers/:userId/addresses/:id` | 1 | `{ id, userId, lat, lng, addressText }` (404 if not owned) |
 | `product.client.getBranchProducts` | `POST /api/internal/branches/:id/products/batch` `{ productIds }` | 1 | `[{ productId, name, imageUrl, price: "55.00", stock, isAvailable }]` — one call for the whole cart |
 | `stock.client.reserveStock` | `POST /api/internal/branches/:id/stock/reserve` `{ orderPublicId, items }` (idem) | 1 | 204, or 409 with the products that underflowed (atomic decrement) |
-| `stock.client.releaseStock` | `POST /api/internal/branches/:id/stock/release` `{ orderPublicId }` (idem) | 1 | 204 — restock on cancel/reject |
+| `stock.client.releaseStock` / `releaseStockBatch` | `POST /api/internal/stock/release` `{ orders: [{ branchId, orderPublicId }] }` (idem, ≤ 100) | 1 | 204 — restock on cancel/reject; the payment sweep releases a whole batch in one call |
 | `permission.client.getRolePermissions` | `GET /api/internal/roles/:roleName/permissions` | 1 | `["order:order:read", ...]` |
 | `user.client.getUsers` | `GET /api/internal/users?ids=1,2,3` | 3 | `[{ id, name, phone }]` — batched agent snapshots |
+
+**No per-row core calls.** Every lookup of branches, restaurants or users goes through `readThroughMany` (`lib/core-client/read-through.ts`): ONE Redis `MGET` for all ids, then ONE core batch call (≤ 100 ids) for the misses. `getBranch(id)` / `getRestaurant(id)` are the same path with one id. A loop that calls a client once per row is a bug.
 
 Core prices are `DECIMAL` strings; convert with `pkg/utils/money.toMinor("55.00") === 5500` (string math, never float).
 
@@ -130,4 +132,14 @@ References: [payment sessions](https://developers.kashier.io/payment/payment-ses
 | Refunds | `IPaymentProvider.refund(providerReferenceId, amount)`; result confirmed by a refund webhook |
 | Secrets | `KASHIER_API_KEY`, `KASHIER_WEBHOOK_SECRET` only in env; never logged; `raw_init_payload` stores no secrets |
 
-Env (Phase 2): `KASHIER_BASE_URL, KASHIER_MERCHANT_ID, KASHIER_API_KEY, KASHIER_WEBHOOK_SECRET, KASHIER_RETURN_URL, KASHIER_FAIL_URL, PAYMENT_SESSION_TIMEOUT_MIN`.
+Env (Phase 2): `KASHIER_BASE_URL` (sessions, `test-api` / `api`), `KASHIER_FEP_BASE_URL` (order operations / refunds, `test-fep` / `fep`), `KASHIER_MERCHANT_ID`, `KASHIER_SECRET_KEY` (`Authorization` header), `KASHIER_API_KEY` (`api-key` header), `KASHIER_WEBHOOK_SECRET` (HMAC key — Kashier signs with the **Payment API Key**), `KASHIER_RETURN_URL`, `KASHIER_WEBHOOK_URL` (public URL of the webhook, sent as `serverWebhook`), `KASHIER_TIMEOUT_MS`, `KASHIER_WEBHOOK_AMOUNT_UNIT` (`major`/`minor`, unit of `data.amount`), `PAYMENT_SESSION_TIMEOUT_MIN`, `PAYMENT_SWEEP_INTERVAL_SEC`. Kashier has no fail URL: `failureRedirect: true` sends failures to the return URL too.
+
+Kashier v3 calls as implemented (`pkg/payments/kashier/`):
+
+| Call | Request | Notes |
+|---|---|---|
+| Create session | `POST {KASHIER_BASE_URL}/v3/payment/sessions` | body `amount` is a major-unit string (`"100.00"`), `order` = merchant reference, `expireAt`, `merchantRedirect`, `serverWebhook`; response `_id` + `sessionUrl` |
+| Refund | `PUT {KASHIER_FEP_BASE_URL}/v3/orders/{kashierOrderId}` | `{apiOperation: "REFUND", reason, transaction: {amount}}` (major units). **Never retried** (a timed-out refund may have succeeded): on timeout the refund row stays `pending` and the webhook decides |
+| Webhook | `x-kashier-signature` = HMAC-SHA256 hex of the sorted `data.signatureKeys` as `k=v&…` (values URL-encoded like `query-string`) | events `pay`/`capture` → payment, `refund`/`partial_refund` → refund, others acked and ignored; outcome in `data.status` (`SUCCESS`/`FAILURE`/`PENDING`) |
+
+Merchant reference: `<region>_<publicId>` for the first session of an order, `<region>_<publicId>_<n>` for later ones (Kashier wants `order` unique per merchant). Dedupe id of a webhook: `<event>:<transactionId>:<status>`.

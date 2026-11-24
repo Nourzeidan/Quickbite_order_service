@@ -1,7 +1,7 @@
 import type {Knex} from "knex";
 
 // Partitioned like orders, on the parent's created_at (copied into order_created_at), so a month of
-// orders and its items live in partitions with the same bounds (archival detaches both, Phase 7).
+// orders and its items live in partitions with the same bounds (archival drops both once emptied, Phase 5).
 // The FK must reference orders' PK (id, created_at), hence the composite FK.
 export async function up(knex: Knex): Promise<void> {
     await knex.raw(`

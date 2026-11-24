@@ -106,7 +106,7 @@ Race on the last unit of stock: core's `reserveStock` is an atomic conditional d
 - `publicId` is a UUIDv7; `created_at` is derived from it (partitioning, database-design §4.0).
 - Stock reservation after commit: `409` → order `cancelled` with `out_of_stock_post_commit`, the stored idempotent response becomes the same `409 Out of stock`. Core unreachable (503) → order `cancelled` with `stock_reservation_failed`, the idempotency row is **deleted** so retrying the same key places a fresh order, and stock is released best-effort.
 - Concurrent requests with the same key and no Redis: the second insert hits the `idempotency_keys` PK (23505), rolls back and answers with the first one's stored response.
-- **Deferred:** the COD `cod_collection` ledger row (the `transactions` table lands in Phase 2), `paymentSummary` from the ledger (Phase 1 reports `pending`, or `failed` for rejected/cancelled), refunds (Phase 2), delivery cancel (Phase 3), WS events + endpoint-cache invalidation (Phase 6).
+- **Since delivered:** COD `cod_collection` row, `paymentSummary` from the ledger, refunds (Phase 2); WS events (added to Phases 1–2 on 2026-11-10); cancelling a `ready` / `assigned` order withdraws offers / notifies the agent (Phase 3).
 
 ## 3. Pricing — `OrderPricingService` (pure, unit-testable)
 
@@ -129,7 +129,7 @@ The client never sends prices. The DB re-checks `total` (`chk_orders_total`).
 | Endpoint | Query | Notes |
 |---|---|---|
 | `GET /orders/:publicId` | Q-O1 + Q-O7 + Q-D2 + Q-P3 | order + items through the 5 s order cache (system-design §4, Layer B2); authorization in the service on every request (customer owns / restaurant member / admin), else 404 |
-| `GET /customer/orders?year=` | Q-O2 | year bound; prior years → `dbArchive(region)` (Phase 7); items count from one `whereIn` |
+| `GET /customer/orders?year=` | Q-O2 | year bound; prior years → `dbArchive(region)` (Phase 5); items count from one `whereIn` |
 | `GET /restaurant/orders` | Q-O3 | `requireBranchAccess`, `withCache(10)`; range ≤ 1 year |
 | `GET /admin/orders` | Q-O3/Q-O2 per shard | fan-out with tagged cursor when `X-Region: all` |
 

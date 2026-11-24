@@ -10,7 +10,7 @@ import {unAuthorizedError} from "../../../lib/auth/errors.js";
 import type {PermissionCacheService} from "../../../lib/auth/permission-cache.service.js";
 import type {StockClient} from "../../../lib/core-client/stock.client.js";
 import {SecsToMS} from "../../../pkg/utils/time.js";
-import {OrderActor, OrderStatus, type PatchableStatus} from "../enums.js";
+import {OrderActor, OrderStatus, PaymentMethod, type PatchableStatus} from "../enums.js";
 import {
     CancellationWindowExpiredError,
     InvalidStatusTransitionError,
@@ -22,6 +22,11 @@ import type {UpdateOrderStatusRequestDTO} from "../dto/order.request.dto.js";
 import {OrderStatusResponseDTO} from "../dto/order.response.dto.js";
 import {findOrderByPublicId, updateOrderStatus} from "../repository/order.repo.js";
 import type {OrderCacheService} from "./order-cache.service.js";
+import type {OrderEventsService} from "./order-events.service.js";
+import type {DeliveryNotifierService} from "../../delivery/service/delivery-notifier.service.js";
+import type {PaymentLedgerService} from "../../payment/service/payment-ledger.service.js";
+import type {RefundService} from "../../payment/service/refund.service.js";
+import {toPaymentRef} from "../payment-ref.js";
 
 const {CUSTOMER, RESTAURANT, ADMIN, SYSTEM, AGENT} = OrderActor;
 
@@ -45,11 +50,13 @@ const TRANSITIONS: Partial<Record<OrderStatus, Partial<Record<OrderStatus, Order
         [OrderStatus.READY]: [RESTAURANT, ADMIN],
         [OrderStatus.CANCELLED]: [RESTAURANT, ADMIN],
     },
+    // Phase 3: agents choose orders (deliveries.md §2). Nobody assigns an agent except the agent.
     [OrderStatus.READY]: {
-        [OrderStatus.ASSIGNED]: [SYSTEM, ADMIN],
+        [OrderStatus.ASSIGNED]: [AGENT],
         [OrderStatus.CANCELLED]: [RESTAURANT, ADMIN],
     },
     [OrderStatus.ASSIGNED]: {
+        [OrderStatus.READY]: [AGENT, SYSTEM],           // released by the agent, or taken back from a silent agent
         [OrderStatus.PICKED]: [AGENT],
         [OrderStatus.CANCELLED]: [ADMIN],
     },
@@ -72,20 +79,17 @@ export class OrderStatusService {
     constructor(
         @inject(TOKENS.PermissionCacheService) private readonly permissionCache: PermissionCacheService,
         @inject(TOKENS.StockClient) private readonly stockClient: StockClient,
-        @inject(TOKENS.OrderCacheService) private readonly orderCache: OrderCacheService
+        @inject(TOKENS.OrderCacheService) private readonly orderCache: OrderCacheService,
+        @inject(TOKENS.PaymentLedgerService) private readonly ledger: PaymentLedgerService,
+        @inject(TOKENS.RefundService) private readonly refundService: RefundService,
+        @inject(TOKENS.OrderEventsService) private readonly orderEvents: OrderEventsService,
+        @inject(TOKENS.DeliveryNotifierService) private readonly deliveryNotifier: DeliveryNotifierService
     ){}
 
     // the source statuses from which `actor` may move an order to `to` (for the conditional UPDATE)
-    allowedSources = (to: OrderStatus, actor: OrderActor): OrderStatus[] => {
-        return (Object.keys(TRANSITIONS) as OrderStatus[])
-            .filter((from) => TRANSITIONS[from]?.[to]?.includes(actor));
-    }
+    allowedSources = (to: OrderStatus, actor: OrderActor): OrderStatus[] => allowedSources(to, actor)
 
-    assertTransition = (from: OrderStatus, to: OrderStatus, actor: OrderActor) => {
-        if(!TRANSITIONS[from]?.[to]?.includes(actor)){
-            throw InvalidStatusTransitionError;
-        }
-    }
+    assertTransition = (from: OrderStatus, to: OrderStatus, actor: OrderActor) => assertTransition(from, to, actor)
 
     // PATCH /orders/:publicId/status
     changeStatus = async (region: string, user: JwtPayload, publicId: string, data: UpdateOrderStatusRequestDTO, correlationId: string) => {
@@ -111,23 +115,60 @@ export class OrderStatusService {
             this.assertCustomerCanCancel(order);
         }
 
-        // conditional write (Q-O8): only from the status we validated against
-        const updated = await updateOrderStatus(order, [order.status], data.status, needsReason ? reason : null, conn);
-        if(!updated){
-            throw InvalidStatusTransitionError;
+        // conditional write (Q-O8): only from the status we validated against.
+        // reject / cancel also void the payment side in the same transaction (orders.md §5).
+        const voiding = needsReason;
+        let updated: Order | null;
+        let refundIds: number[] = [];
+        const trx = await conn.transaction();
+        try{
+            updated = await updateOrderStatus(order, [order.status], data.status, needsReason ? reason : null, trx);
+            if(!updated){
+                throw InvalidStatusTransitionError;
+            }
+            if(voiding){
+                const ref = toPaymentRef(updated);
+                const voidReason = `order ${data.status} by ${actor}${reason ? `: ${reason}` : ""}`;
+                if(updated.paymentMethod === PaymentMethod.COD){
+                    await this.ledger.voidCodCollection(ref, voidReason, trx);
+                }else{
+                    await this.ledger.cancelOpenSessions(ref, trx);
+                    // paid online order: the refund is reserved in this trx (survives a crash after commit)
+                    refundIds = await this.refundService.queueOrderRefunds(ref, voidReason, trx);
+                }
+            }
+            await trx.commit();
+        }catch(err){
+            await trx.rollback();
+            throw err;
         }
+        const changed: Order = updated;
 
-        // after commit. refunds (Phase 2), delivery cancel (Phase 3), WS + list caches (Phase 6) hook in here.
-        await this.orderCache.invalidate(region, updated.publicId);
-        if(updated.status === OrderStatus.REJECTED || updated.status === OrderStatus.CANCELLED){
-            this.stockClient.releaseStock(updated.branchId, updated.publicId, correlationId).catch((err) => {
+        // after commit
+        await this.orderCache.invalidate(region, changed.publicId);
+        this.orderEvents.statusChanged(changed);
+        if(changed.status === OrderStatus.CANCELLED || changed.status === OrderStatus.REJECTED){
+            // agents: a ready order loses its open offers, an assigned one is taken from its agent
+            if(order.status === OrderStatus.READY){
+                await this.deliveryNotifier.withdrawOffers(region, changed.publicId, "order cancelled");
+            }else if(order.status === OrderStatus.ASSIGNED && order.deliveryAgentId !== null){
+                this.deliveryNotifier.taskCancelled(order.deliveryAgentId, changed.publicId, "order cancelled");
+            }
+        }
+        if(voiding){
+            this.stockClient.releaseStock(changed.branchId, changed.publicId, correlationId).catch((err) => {
                 logger.error("stock release failed after cancel", {
-                    region, orderPublicId: updated.publicId, correlationId, error: (err as Error).message,
+                    region, orderPublicId: changed.publicId, correlationId, error: (err as Error).message,
                 });
             });
+            // send the reserved refunds to Kashier; not awaited (the PATCH doesn't wait for Kashier),
+            // never throws, and the refund sweep sends anything this misses
+            if(refundIds.length > 0){
+                void this.refundService.sendQueued(region, refundIds, correlationId);
+            }
         }
 
-        return OrderStatusResponseDTO.from(updated);
+        return OrderStatusResponseDTO.from(changed);
     }
 
     // who the caller is for THIS order. Not related to the order -> 404 (no existence leak).
@@ -182,4 +223,17 @@ export function isRestaurantMemberOf(user: JwtPayload, order: Order): boolean {
         return true;
     }
     return (user.branchIds ?? []).map(Number).includes(order.branchId);
+}
+
+
+// the source statuses from which `actor` may move an order to `to` (for conditional UPDATEs)
+export function allowedSources(to: OrderStatus, actor: OrderActor): OrderStatus[] {
+    return (Object.keys(TRANSITIONS) as OrderStatus[])
+        .filter((from) => TRANSITIONS[from]?.[to]?.includes(actor));
+}
+
+export function assertTransition(from: OrderStatus, to: OrderStatus, actor: OrderActor) {
+    if(!TRANSITIONS[from]?.[to]?.includes(actor)){
+        throw InvalidStatusTransitionError;
+    }
 }

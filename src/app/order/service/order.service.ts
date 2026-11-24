@@ -3,8 +3,10 @@ import {isUUID} from "class-validator";
 import {v7 as uuidv7} from "uuid";
 import type {Knex} from "knex";
 import {TOKENS} from "../../../lib/di/tokens.js";
-import {db, dbArchive} from "../../../lib/knex/knex.js";
+import {db} from "../../../lib/knex/knex.js";
 import {env} from "../../../lib/config/env.js";
+import {hotSource, readSourcesForRange, touchesPriorYear, type ReadSource} from "../../../lib/knex/read-sources.js";
+import {isSourceCursors, mergeKeysetPages, type SourceCursors} from "../../../lib/http/pagination/keyset-merge.js";
 import {logger} from "../../../lib/logger/logger.js";
 import type {JwtPayload} from "../../../lib/auth/jwt.js";
 import {SystemRole} from "../../../lib/auth/enums.js";
@@ -20,6 +22,7 @@ import type {ProductClient} from "../../../lib/core-client/product.client.js";
 import type {StockClient} from "../../../lib/core-client/stock.client.js";
 import type {CoreBranchProduct} from "../../../lib/core-client/types.js";
 import {daysToMs, startOfUtcYear} from "../../../pkg/utils/time.js";
+import {timeOfUuidV7} from "../../../pkg/utils/uuid.js";
 import {
     CANCEL_REASON_OUT_OF_STOCK,
     CANCEL_REASON_STOCK_RESERVATION_FAILED,
@@ -50,22 +53,24 @@ import type {
 import {
     OrderDetailResponseDTO,
     OrderResponseDTO,
-    OrderSummaryResponseDTO,
-    type PaymentSummary
+    OrderSummaryResponseDTO
 } from "../dto/order.response.dto.js";
 import type {DateRange, OrderCursor, OrderListFilter} from "../types.js";
 import {insertOrder, findOrderByPublicId, listOrders, updateOrderStatus} from "../repository/order.repo.js";
-import {countItemsByOrders, insertOrderItems} from "../repository/order-item.repo.js";
+import {countItemsByOrders, findItemsByOrders, insertOrderItems} from "../repository/order-item.repo.js";
 import {
     deleteIdempotencyKeyByHash,
     findIdempotencyKeyByHash,
     insertIdempotencyKey,
     PG_UNIQUE_VIOLATION,
     updateIdempotencyKeyResponse
-} from "../repository/idempotency-key.repo.js";
+} from "../../../lib/idempotency/idempotency-key.repo.js";
 import {priceOrder, type PricingLine} from "./order-pricing.service.js";
 import {isRestaurantMemberOf, type OrderStatusService} from "./order-status.service.js";
-import type {OrderCacheService} from "./order-cache.service.js";
+import type {OrderCacheService, OrderSnapshot} from "./order-cache.service.js";
+import {toPaymentRef} from "../payment-ref.js";
+import type {PaymentLedgerService} from "../../payment/service/payment-ledger.service.js";
+import type {OrderEventsService} from "./order-events.service.js";
 
 const MAX_QUANTITY_PER_PRODUCT = 50;
 const MAX_LIST_RANGE_MS = daysToMs(366);
@@ -81,9 +86,10 @@ export interface OrderListResult {
     meta: PaginationMeta;
 }
 
-// cursor state: per region the last row returned ([createdAtISO, publicId]) or "end" when exhausted.
-// a region absent from the map has not been read yet.
-type CursorState = Record<string, [string, string] | "end">;
+// cursor state: per source ("eg", "eg:archive", ...) the last row returned ([createdAtISO, publicId])
+// or "end" when exhausted; a source absent from the map has not been read yet (keyset-merge.ts)
+type OrderPosition = [string, string];
+type CursorState = SourceCursors<OrderPosition>;
 
 @injectable()
 export class OrderService {
@@ -94,7 +100,9 @@ export class OrderService {
         @inject(TOKENS.ProductClient) private readonly productClient: ProductClient,
         @inject(TOKENS.StockClient) private readonly stockClient: StockClient,
         @inject(TOKENS.OrderStatusService) private readonly orderStatusService: OrderStatusService,
-        @inject(TOKENS.OrderCacheService) private readonly orderCache: OrderCacheService
+        @inject(TOKENS.OrderCacheService) private readonly orderCache: OrderCacheService,
+        @inject(TOKENS.PaymentLedgerService) private readonly ledger: PaymentLedgerService,
+        @inject(TOKENS.OrderEventsService) private readonly orderEvents: OrderEventsService
     ){}
 
     // POST /orders — docs/business-logic/orders.md §2
@@ -148,6 +156,7 @@ export class OrderService {
         const publicId = uuidv7();
 
         let response: OrderResponseDTO;
+        let placed: Order;
         const trx = await conn.transaction();
         try{
             const order = await insertOrder({
@@ -160,6 +169,8 @@ export class OrderService {
                 customerAddressId: address.id,
                 deliveryLat: address.lat,
                 deliveryLng: address.lng,
+                pickupLat: branch.lat,
+                pickupLng: branch.lng,
                 deliveryAddressText: address.addressText,
                 status: online ? OrderStatus.PENDING_PAYMENT : OrderStatus.PLACED,
                 subtotal: pricing.subtotal,
@@ -177,10 +188,13 @@ export class OrderService {
                 ...item,
             })), trx);
 
-            // TODO(phase-2): COD -> paymentService.recordCodCollection(order, restaurant.ownerId, trx)
-            // (the transactions table lands with Payments)
+            // COD: the money is collected at the door -> pending ledger row now (payments.md §7)
+            if(!online){
+                await this.ledger.recordCodCollection(toPaymentRef(order), restaurant.ownerId, trx);
+            }
 
             response = OrderResponseDTO.from(order, items);
+            placed = order;
             if(idempotency){
                 await insertIdempotencyKey({
                     keyHash: idempotency.keyHash,
@@ -222,7 +236,10 @@ export class OrderService {
             throw OutOfStockError;
         }
 
-        // TODO(phase-6): COD -> WS order.created to branch:<id>, restaurant:<id>
+        // COD goes straight into the restaurant's queue; online waits for the capture (OrderPaymentService.afterPaid)
+        if(!online){
+            this.orderEvents.created(placed, response.items.length);
+        }
         return {order: response, replayed: false};
     }
 
@@ -232,19 +249,28 @@ export class OrderService {
         if(!isUUID(publicId)){
             throw OrderNotFoundError;
         }
-        const snapshot = await this.orderCache.getOrLoad(region, publicId, db(region));
-        if(!snapshot || !canRead(user, snapshot.order)){
+        const found = await this.loadDetail(region, publicId);
+        if(!found || !canRead(user, found.snapshot.order)){
             throw OrderNotFoundError;
         }
-        const {order, items} = snapshot;
-        return OrderDetailResponseDTO.fromDetail(order, items, paymentSummaryOf(order));
+        const {snapshot: {order, items}, conn} = found;
+        // ledger is read fresh (one indexed query, Q-P3) from the cluster the order was found on:
+        // payment state must not lag behind the cache
+        const ledger = await this.ledger.summarize(toPaymentRef(order), order.paymentMethod, isVoided(order), conn);
+        return OrderDetailResponseDTO.fromDetail(order, items, {
+            method: order.paymentMethod,
+            status: ledger.status,
+            amount: order.total,
+            refundedAmount: ledger.refundedAmount,
+            currency: order.currency,
+        });
     }
 
     // GET /customer/orders?year= — one calendar year
     listForCustomer = async (region: string, user: JwtPayload, query: CustomerOrdersQueryDTO): Promise<OrderListResult> => {
         const year = query.year ?? new Date().getUTCFullYear();
         const range = {from: startOfUtcYear(year), to: startOfUtcYear(year + 1)};
-        return this.list([region], {customerId: user.userId}, range, query, () => readConnForYear(region, year));
+        return this.list(readSourcesForRange(region, range), {customerId: user.userId}, range, query);
     }
 
     // GET /restaurant/orders?branchId=&status=&from=&to=
@@ -253,7 +279,8 @@ export class OrderService {
         if(query.status) filter.status = query.status;
         // requireBranchAccess lets owners through for any branch id: scope to their restaurant here
         if(user.role !== SystemRole.ADMIN) filter.restaurantId = Number(user.restaurantId);
-        return this.list([region], filter, parseRange(query.from, query.to), query, () => db(region));
+        const range = parseRange(query.from, query.to);
+        return this.list(readSourcesForRange(region, range), filter, range, query);
     }
 
     // GET /admin/orders — X-Region: all fans out to every shard with a per-region cursor
@@ -262,71 +289,76 @@ export class OrderService {
         if(query.branchId) filter.branchId = query.branchId;
         if(query.status) filter.status = query.status;
         const regions = region === ALL_REGIONS ? [...REGIONS] : [region];
-        return this.list(regions, filter, parseRange(query.from, query.to), query, (shard) => db(shard));
+        const range = parseRange(query.from, query.to);
+        return this.list(regions.flatMap((shard) => readSourcesForRange(shard, range)), filter, range, query);
     }
 
-    // one keyset page across one or more shards; never OFFSET, never a query per row
+    // one keyset page across one or more sources (shards for X-Region: all, archive + hot for prior
+    // years); never OFFSET, never a query per row. The merge itself lives in keyset-merge.ts.
     private list = async (
-        regions: string[],
+        sources: ReadSource[],
         filter: OrderListFilter,
         range: DateRange,
-        query: {cursor?: string; limit?: number},
-        connFor: (region: string) => Knex
+        query: {cursor?: string; limit?: number}
     ): Promise<OrderListResult> => {
         const limit = query.limit ?? DEFAULT_PAGE_SIZE;
         const state = decodeCursor(query.cursor, isCursorState);
         if(query.cursor && !state){
             throw InvalidCursorError;
         }
-        const cursorState: CursorState = state ?? {};
 
-        const perRegion = await Promise.all(regions.map(async (region) => {
-            const position = cursorState[region];
-            if(position === "end"){
-                return {region, orders: [] as Order[]};
-            }
-            const cursor: OrderCursor | null = position ? {createdAt: new Date(position[0]), publicId: position[1]} : null;
-            const orders = await listOrders(filter, range, {cursor, limit}, connFor(region));
-            return {region, orders};
-        }));
+        const page = await mergeKeysetPages<Order, OrderPosition>({
+            sources,
+            state: state ?? {},
+            limit,
+            fetch: (source, position) => {
+                const cursor: OrderCursor | null = position ? {createdAt: new Date(position[0]), publicId: position[1]} : null;
+                return listOrders(filter, range, {cursor, limit}, source.conn);
+            },
+            compare: compareNewestFirst,
+            identity: (order) => order.publicId,
+            cursorOf: (order) => [order.createdAt.toISOString(), order.publicId],
+        });
 
-        // merge newest first, keep `limit`
-        const merged = perRegion
-            .flatMap(({region, orders}) => orders.map((order) => ({region, order})))
-            .sort((a, b) => compareNewestFirst(a.order, b.order))
-            .slice(0, limit);
-
-        const nextState: CursorState = {...cursorState};
-        for(const {region, orders} of perRegion){
-            if(cursorState[region] === "end") continue;
-            const taken = merged.filter((row) => row.region === region);
-            const last = taken[taken.length - 1];
-            if(taken.length === orders.length && orders.length <= limit){
-                nextState[region] = "end";
-            }else if(last){
-                nextState[region] = [last.order.createdAt.toISOString(), last.order.publicId];
-            }
-        }
-        const hasMore = regions.some((region) => nextState[region] !== "end");
-
-        // items count: one grouped query per shard touched, never per row
+        // items count: one grouped query per source touched, never per row
         const counts = new Map<string, number>();
-        await Promise.all(regions.map(async (region) => {
-            const orders = merged.filter((row) => row.region === region).map((row) => row.order);
-            const byId = await countItemsByOrders(orders, connFor(region));
+        await Promise.all(sources.map(async (source) => {
+            const orders = page.rows.filter((row) => row.source === source).map((row) => row.row);
+            if(orders.length === 0) return;
+            const byId = await countItemsByOrders(orders, source.conn);
             for(const order of orders){
                 counts.set(order.publicId, byId.get(order.id) ?? 0);
             }
         }));
 
         return {
-            data: merged.map(({order}) => OrderSummaryResponseDTO.from(order, counts.get(order.publicId) ?? 0)),
+            data: page.rows.map(({row: order}) => OrderSummaryResponseDTO.from(order, counts.get(order.publicId) ?? 0)),
             meta: {
-                nextCursor: hasMore ? encodeCursor(nextState) : null,
-                hasMore,
-                count: merged.length,
+                nextCursor: page.hasMore ? encodeCursor(page.nextState) : null,
+                hasMore: page.hasMore,
+                count: page.rows.length,
             },
         };
+    }
+
+    // GET /orders/:publicId: the year is inside the UUIDv7, so the cluster is known before any query.
+    //   current year -> hot, through the 5 s order cache (as before)
+    //   prior year   -> archive, then hot; no cache: rare reads, and the archiver moves these rows
+    private loadDetail = async (region: string, publicId: string): Promise<{snapshot: OrderSnapshot; conn: Knex} | null> => {
+        const createdAt = timeOfUuidV7(publicId);
+        if(!touchesPriorYear(createdAt)){
+            const conn = hotSource(region).conn;
+            const snapshot = await this.orderCache.getOrLoad(region, publicId, conn);
+            return snapshot ? {snapshot, conn} : null;
+        }
+        for(const source of readSourcesForRange(region, {from: createdAt})){
+            const order = await findOrderByPublicId(publicId, source.conn);
+            if(order){
+                const items = await findItemsByOrders([order], source.conn);
+                return {snapshot: {order, items}, conn: source.conn};
+            }
+        }
+        return null;
     }
 
     private findReplay = async (idempotency: IdempotencyContext, conn: Knex): Promise<PlaceOrderResult | null> => {
@@ -359,10 +391,13 @@ export class OrderService {
         }
         const fromStatuses = this.orderStatusService.allowedSources(OrderStatus.CANCELLED, OrderActor.SYSTEM);
 
+        let voided: Order | null;
         const trx = await conn.transaction();
         try{
-            await updateOrderStatus(current, fromStatuses, OrderStatus.CANCELLED, reason, trx);
-            // TODO(phase-2): COD -> cod_collection 'failed' + 0-amount adjustment
+            voided = await updateOrderStatus(current, fromStatuses, OrderStatus.CANCELLED, reason, trx);
+            if(voided && voided.paymentMethod === PaymentMethod.COD){
+                await this.ledger.voidCodCollection(toPaymentRef(voided), reason, trx);
+            }
             if(idempotency){
                 if(reason === CANCEL_REASON_OUT_OF_STOCK){
                     // a retry with the same key gets the same 409
@@ -379,6 +414,9 @@ export class OrderService {
         }
 
         await this.orderCache.invalidate(region, order.publicId);
+        if(voided){
+            this.orderEvents.statusChanged(voided);
+        }
         logger.warn("order voided after commit", {region, orderPublicId: order.publicId, reason, correlationId});
         if(reason === CANCEL_REASON_STOCK_RESERVATION_FAILED){
             // core may have reserved before the timeout; release is a no-op otherwise
@@ -430,18 +468,9 @@ function canRead(user: JwtPayload, order: Order): boolean {
     }
 }
 
-// TODO(phase-2): derive from the ledger (latest charge / cod_collection + refunds).
-// Phase 1 has no transactions table: nothing is collected before delivery, and a rejected /
-// cancelled order will never be collected.
-function paymentSummaryOf(order: Order): PaymentSummary {
-    const voided = order.status === OrderStatus.CANCELLED || order.status === OrderStatus.REJECTED;
-    return {
-        method: order.paymentMethod,
-        status: voided ? "failed" : "pending",
-        amount: order.total,
-        refundedAmount: 0,
-        currency: order.currency,
-    };
+// a rejected / cancelled order will never be collected
+function isVoided(order: Order): boolean {
+    return order.status === OrderStatus.CANCELLED || order.status === OrderStatus.REJECTED;
 }
 
 // default: Jan 1 of the current year -> now. Bounded to one year so index range scans stay small.
@@ -455,12 +484,6 @@ function parseRange(from: string | undefined, to: string | undefined): DateRange
     return {from: start, to: new Date(end.getTime() + 1)};
 }
 
-// prior years move to the archive cluster in Phase 7; until it is configured they are still hot
-function readConnForYear(region: string, year: number): Knex {
-    const archived = year < new Date().getUTCFullYear() && env.archiveShards[region] !== undefined;
-    return archived ? dbArchive(region) : db(region);
-}
-
 function compareNewestFirst(a: Order, b: Order): number {
     const byTime = b.createdAt.getTime() - a.createdAt.getTime();
     if(byTime !== 0) return byTime;
@@ -468,15 +491,8 @@ function compareNewestFirst(a: Order, b: Order): number {
 }
 
 function isCursorState(value: unknown): value is CursorState {
-    if(typeof value !== "object" || value === null || Array.isArray(value)){
-        return false;
-    }
-    return Object.entries(value).every(([region, position]) =>
-        REGIONS.includes(region) && (
-            position === "end" ||
-            (Array.isArray(position) && position.length === 2 &&
-                typeof position[0] === "string" && !Number.isNaN(Date.parse(position[0])) &&
-                typeof position[1] === "string" && isUUID(position[1]))
-        )
-    );
+    return isSourceCursors(value, (position): position is OrderPosition =>
+        Array.isArray(position) && position.length === 2 &&
+        typeof position[0] === "string" && !Number.isNaN(Date.parse(position[0])) &&
+        typeof position[1] === "string" && isUUID(position[1]));
 }

@@ -68,7 +68,7 @@ export enum PaymentProvider { KASHIER = 1, COD = 2 }      // fixed ids, seeded o
      - order stays `pending_payment` (customer may retry `init` until the sweep expires it).
    - **refund succeeded / failed**:
      - pending `refund` row by `provider_reference_id` [Q-P4] → `succeeded` / `failed`.
-     - on success: original charge `is_refunded = (refunded sum = charge amount)`; if the order was already delivered (settled) → debit the restaurant share via `FinanceService.debitForRefund(trx, …)` (locks the balance, capped at the balance, remainder as `adjustment`).
+     - on success: original charge `is_refunded = (refunded sum = charge amount)`; if the order was already delivered (settled) → debit the restaurant share via `FinanceService.debitForRefund` (restaurant-finance.md §5). The webhook locks the **order row first** (same lock order as settlement), so a refund confirmed before delivery is taken back by the settlement instead.
 3. Stamp `processed_at`. If anything threw: rollback, then store `process_error` on the event and return 500 so Kashier retries.
 4. After commit (success path): WS `payment.captured` → `customer:<id>`; `order.created` → `branch:<id>`, `restaurant:<id>`. Failure: `payment.failed` → `customer:<id>`.
 
@@ -105,6 +105,17 @@ COD orders never have a `charge`; a COD "refund" before delivery is the void des
 ## 8. Reads
 
 - `GET /payments/:paymentId` — PK lookup; admin, or restaurant user with `order:payment read` whose `restaurantId` matches the transaction's order (or whose owner id is `src`/`dst`).
+
+## 8.1 Implementation notes (Phase 2)
+
+- Cross-module access: the payment module reaches orders only through `OrderPaymentService` (order module); the order module writes the ledger through `PaymentLedgerService` (COD row, COD void, cancelling open sessions, `paymentSummary`) and refunds through `RefundService`.
+- Webhook → session: matched by `merchant_order_ref` (Kashier sends no session id). A charge for the same Kashier transaction is written once (`kashier-charge:<tx>:<status>`), so a `pay` + `capture` pair doesn't double-charge.
+- Money arriving for an order that is no longer `pending_payment` (sweep/customer cancel, or paid through a second session) → the order is left alone and **that charge** is refunded automatically.
+- A webhook whose processing threw keeps `processed_at = NULL`; the provider's retry processes it again (not treated as a duplicate).
+- Refunds are **reserved in the transaction that decides them** (admin request, order reject/cancel, late capture) and **sent after commit**, claimed once via `provider_requested_at`. The refund sweep (part of the payment sweep) sends reserved rows nobody sent (crash after commit) and alerts on sent rows with no outcome after `REFUND_STALE_ALERT_MIN`; those are never re-sent automatically.
+- The payment sweep cancels at `PAYMENT_SESSION_TIMEOUT_MIN + PAYMENT_SWEEP_GRACE_MIN`, so a payment finished in the session's last seconds still places the order.
+- Refund timeouts keep the row `pending` (Kashier may have refunded); only an explicit rejection marks it `failed`. The refund webhook matches by Kashier's refund transaction id, or — if it arrived before we stored that id — by the charge's kashierOrderId + amount.
+- `idempotency_keys` repo moved to `lib/idempotency/idempotency-key.repo.ts` (shared by `POST /orders` and `POST /payments/init`).
 
 ## 9. Invariants
 

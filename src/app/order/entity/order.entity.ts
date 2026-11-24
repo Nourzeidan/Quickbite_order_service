@@ -22,6 +22,8 @@ export class Order {
     currency: Currency;
     paymentMethod: PaymentMethod;
     deliveryAgentId: number | null;
+    pickupLat: number | null;               // branch position snapshotted at placement (Phase 3); null on older orders
+    pickupLng: number | null;
     createdAt: Date;
     updatedAt: Date;
     acceptedAt: Date | null;
@@ -54,6 +56,8 @@ export class Order {
         this.currency = data.currency!;
         this.paymentMethod = data.paymentMethod!;
         this.deliveryAgentId = data.deliveryAgentId ?? null;
+        this.pickupLat = data.pickupLat ?? null;
+        this.pickupLng = data.pickupLng ?? null;
         this.createdAt = data.createdAt!;
         this.updatedAt = data.updatedAt!;
         this.acceptedAt = data.acceptedAt ?? null;

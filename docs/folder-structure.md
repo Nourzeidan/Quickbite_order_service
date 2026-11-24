@@ -17,7 +17,8 @@ order-service/
     ├── app.ts                                 ✅ express composition (helmet, cors, json, cookie, correlation, region, routes, errorHandler)
     ├── server.ts                              ✅ HTTP server + socket.io + core-events consumer + graceful shutdown
     ├── routes.ts                              ✅ mounts every module router under /api
-    ├── worker.ts                                 Phase 7 — archival worker entry
+    ├── worker.ts                                 background jobs entry (`npm run worker`): offers, sweeps, partitions, cleanup
+    ├── archiver.ts                               ✅ Phase 5 — archival process (`npm run archiver`, `npm run archive:once`)
     │
     ├── app/                                   business modules
     │   ├── health/health.routes.ts            ✅
@@ -89,14 +90,14 @@ order-service/
     │   ├── error/{AppError.ts, errorHandler.ts}   ✅
     │   ├── http/
     │   │   ├── response.ts                    ✅ sendSuccess, sendPaginated
-    │   │   └── pagination/{cursor-pagination.ts, parse-query.ts}   ✅ (core copies)
+    │   │   └── pagination/{cursor-pagination.ts, parse-query.ts, keyset-merge.ts}   ✅ (core copies; keyset-merge: one page over several sources)
     │   ├── idempotency/{idempotency.ts, errors.ts}   ✅ Redis (user-scoped, fingerprint, in-flight lock); DB store wired in Phase 1
     │   ├── knex/
-    │   │   ├── knex.ts                        ✅ db(region), dbArchive(region), pingAll, destroyAll
+    │   │   ├── knex.ts                        ✅ db(region), dbArchive(region), pingAll, pingAllArchives, destroyAll
+    │   │   ├── read-sources.ts                ✅ Phase 5 — which cluster(s) answer a read (hot / archive + hot)
     │   │   ├── knexfile.ts                    ✅ buildKnexConfig(shard) + default export for the knex CLI
     │   │   └── migrate-all.ts                 ✅ runs migrations on every shard (hot or archive)
     │   ├── jobs/{interval-job.ts, partition-maintenance.ts}   Phase 1 — pg_partman maintenance timer
-    │   ├── jobs/archival.worker.ts               Phase 7
     │   ├── logger/logger.ts                   ✅
     │   ├── messaging/init.ts                  ✅ the RabbitMQ client instance
     │   ├── sharding/{regions.ts, region-resolver.ts, errors.ts}   ✅

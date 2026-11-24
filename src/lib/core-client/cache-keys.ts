@@ -6,6 +6,7 @@ export const CORE_CACHE_KEYS = {
     product: (branchId: number, productId: number) => `core:product:price:${branchId}:${productId}`,
     rolePermissions: (roleName: string) => `core:rbac:perms:${roleName}`,
     rolePermissionsStale: (roleName: string) => `core:rbac:perms:${roleName}:stale`,
+    user: (userId: number) => `core:user:${userId}`,
 };
 
 export const CORE_CACHE_TTL_SEC = {
@@ -14,4 +15,5 @@ export const CORE_CACHE_TTL_SEC = {
     product: 30,
     rolePermissions: 5 * 60,
     rolePermissionsStale: 60 * 60,
+    user: 10 * 60,
 };

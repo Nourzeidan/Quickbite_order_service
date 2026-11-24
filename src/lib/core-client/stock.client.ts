@@ -31,12 +31,21 @@ export class StockClient {
 
     // restocks what the order reserved; a repeat (or an order that never reserved) is a no-op on core
     releaseStock = async (branchId: number, orderPublicId: string, correlationId: string): Promise<void> => {
-        await this.coreClient.request<void>({
-            method: "POST",
-            path: `/api/internal/branches/${branchId}/stock/release`,
-            body: {orderPublicId},
-            correlationId,
-            idempotencyKey: `release:${orderPublicId}`,
-        });
+        await this.releaseStockBatch([{branchId, orderPublicId}], correlationId);
+    }
+
+    // many orders (the payment sweep cancels up to 100 at once): ONE core call per 100 orders,
+    // ONE transaction on core. Idempotent there (released reservations are skipped) -> retryable.
+    releaseStockBatch = async (orders: {branchId: number; orderPublicId: string}[], correlationId: string): Promise<void> => {
+        for(let i = 0; i < orders.length; i += 100){
+            const batch = orders.slice(i, i + 100);
+            await this.coreClient.request<void>({
+                method: "POST",
+                path: "/api/internal/stock/release",
+                body: {orders: batch},
+                correlationId,
+                idempotencyKey: `release:${batch.map((order) => order.orderPublicId).join(",")}`,
+            });
+        }
     }
 }

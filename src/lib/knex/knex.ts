@@ -18,7 +18,7 @@ export function db(region: string): Knex {
     return conn;
 }
 
-// archive cluster (prior years) — used from Phase 7
+// archive cluster (prior years, Phase 5): read by year-aware endpoints, written only by the archiver
 export function dbArchive(region: string): Knex {
     assertRegion(region);
     const shard = env.archiveShards[region];
@@ -43,11 +43,20 @@ export interface ShardPing {
     error?: string;
 }
 
-// hot shards only: archive clusters may not exist before Phase 7
+// hot shards (health fails on these)
 export async function pingAll(): Promise<ShardPing[]> {
+    return pingEach((region) => db(region));
+}
+
+// archive shards: reported by /health, but they never fail it (current-year traffic doesn't need them)
+export async function pingAllArchives(): Promise<ShardPing[]> {
+    return pingEach((region) => dbArchive(region));
+}
+
+async function pingEach(connFor: (region: string) => Knex): Promise<ShardPing[]> {
     return Promise.all(env.regions.map(async (region): Promise<ShardPing> => {
         try{
-            await pingDB(region);
+            await connFor(region).raw("SELECT 1+1 AS result");
             return {region, ok: true};
         }catch(err){
             return {region, ok: false, error: (err as Error).message};

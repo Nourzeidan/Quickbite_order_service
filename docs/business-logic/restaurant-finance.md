@@ -1,6 +1,6 @@
 # Restaurant Finance Module
 
-Code: `src/app/restaurant-finance/`. Tables: `restaurant_balances`, `transactions` (payout rows). Endpoints: [api-contracts §5](../api-contracts.md#5-restaurant-finance). Phase 5.
+Code: `src/app/restaurant-finance/`. Tables: `restaurant_balances`, `transactions` (payout rows). Endpoints: [api-contracts §5](../api-contracts.md#5-restaurant-finance). Phase 4 (built 2026-11-18).
 
 Balance **credits** happen in the Deliveries settlement and **refund debits** in the Payments webhook — both through `FinanceService` methods that take the caller's `trx`. This module adds the reads and the one admin write (record payout).
 
@@ -12,7 +12,7 @@ Balance **credits** happen in the Deliveries settlement and **refund debits** in
 
 ## 2. `GET /restaurant/balance` — `FinanceService.getBalance(region, user)`
 
-- `rbac({resource: "order:finance", action: "read"})`; restaurant = `req.user.restaurantId`.
+- `rbac({resource: "order:finance", action: "read"})`; restaurant = `req.user.restaurantId` (admins pass `?restaurantId=`, else 400).
 - All rows of that restaurant [Q-F1] (one per currency).
 - Not cached — owners and admins must see the exact value.
 - **200** `RestaurantBalanceResponseDTO { restaurantId, balances: [{ currency, balance }], asOf }`.
@@ -43,12 +43,28 @@ Balance **credits** happen in the Deliveries settlement and **refund debits** in
 
 The platform records transfers that operations already made; it does not move money itself. If an automated payout API is added later: insert `pending` → call provider → `succeeded` by webhook. The schema already allows it.
 
-## 5. Refund after settlement — `FinanceService.debitForRefund(trx, order, refundAmount)`
+## 5. Refund after settlement — `FinanceService.debitForRefund(order, refundAmount, key, trx)`
 
-Called by the refund webhook when the order was already delivered:
+Called in two places, always with the **order row locked**:
 
-- restaurant share = `Math.min(refundAmount, subtotal − commission)`.
-- lock balance; debit `min(share, balance)`; any remainder → `adjustment` row (`src=ownerId`, `dst=NULL`, note `refund remainder`) so the debt is visible to ops instead of a negative balance.
+1. the **refund webhook**, when the refund succeeds and the order is already `delivered` (`key = refund:<refundId>`);
+2. the **settlement**, for refunds that already succeeded while the order was on its way (`key = settlement:<publicId>`).
+
+The webhook locks the order before the refund/charge rows (the same order as settlement: order → transactions), so the two never interleave and every refund is taken back exactly once: no deadlock, no miss, no double.
+
+```
+takenBack = Σ refund-debit + refund-shortfall adjustments of this order        (Q-P3, one query)
+share     = min(refundAmount, (subtotal − commission) − takenBack)              ← cumulative cap: never more than it earned
+debited   = min(share, balance)                                                 ← balance never < 0
+shortfall = share − debited
+```
+
+| Row | type | status | src → dst | idempotency_key |
+|---|---|---|---|---|
+| debited part | `adjustment` | `succeeded` | owner → platform | `refund-debit:<region>:<key>` |
+| not covered | `adjustment` | `pending` (owed, not collected) | owner → platform | `refund-shortfall:<region>:<key>` |
+
+The delivery-fee part of a refund is the platform's loss. The owner id comes from the order's `commission` row (always written at settlement, even when 0), so no core call happens inside the transaction. Rows with amount 0 are not written.
 
 ## 6. Reconciliation
 
@@ -59,13 +75,15 @@ SELECT
   COALESCE(SUM(o.subtotal) FILTER (WHERE o.status = 'delivered'), 0)
   - COALESCE((SELECT SUM(amount) FROM transactions WHERE transaction_type = 'commission' AND src_acc_id = :ownerId AND status = 'succeeded'), 0)
   - COALESCE((SELECT SUM(amount) FROM transactions WHERE transaction_type = 'payout' AND dst_acc_id = :ownerId AND status = 'succeeded'), 0)
-  - <refund debits recorded as adjustments / refund shares>
+  - COALESCE((SELECT SUM(amount) FROM transactions WHERE transaction_type = 'adjustment' AND status = 'succeeded' AND src_acc_id = :ownerId AND idempotency_key LIKE 'refund-debit:%'), 0)
 FROM orders o WHERE o.restaurant_id = :restaurantId AND o.currency = :currency;
 ```
 
 (Run against hot + archive for full history. Not an API in this milestone.)
 
 ## 7. Settlement formula (implemented in Deliveries)
+
+`branch.commissionBps` is set by a system admin in core: `PATCH /api/branches/:id/commission { commissionBps }` (0–10000, emits `branch.updated`, so order-service drops the cached branch). Orders keep the commission they were settled with (`orders.commission`).
 
 ```
 commission    = floor(order.subtotal × branch.commissionBps / 10000)
@@ -91,4 +109,8 @@ balance delta = order.subtotal − commission
 
 ## 11. Errors (`app/restaurant-finance/errors.ts`)
 
-`RestaurantNotFoundError`, `InsufficientBalanceError`.
+`RestaurantNotFoundError`, `InsufficientBalanceError`, `RestaurantIdRequiredError` (admin read without `restaurantId`).
+
+## 12. Realtime
+
+`restaurant.balance_changed { currency, balance }` → `restaurant:<id>`, after commit, from: the settlement credit (Deliveries), a refund debit (payment webhook, only when something was debited) and a payout.

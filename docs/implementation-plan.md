@@ -15,9 +15,11 @@ Build **one module at a time**, end-to-end, before starting the next. Inside eac
 10. manual smoke test (Postman) + the done-checklist at the end of this file
 ```
 
-Module order: **Phase 0 scaffold → 1 Orders → 2 Payments → 3 Deliveries → 4 Agents → 5 Restaurant finance → 6 WebSocket wiring → 7 Archival**.
+Module order: **Phase 0 scaffold → 1 Orders → 2 Payments → 3 Deliveries & agents → 4 Restaurant finance → 5 Archival**.
 
-Acceptance for every phase: endpoints answer with the documented contract on local Postgres (one DB per region) + Redis + RabbitMQ, idempotency works, RBAC denies the right calls, and (from Phase 6) WebSocket clients receive the documented events.
+> **Restructured 2026-11-10.** The original Phases 3 (Deliveries) and 4 (Agents) are merged into Phase 3, following the agreed ERD (`img_2.png`: no `deliveries` table, delivery state on `orders`). The separate "Phase 6 — WebSocket wiring" is removed: **every phase ships its own realtime events** (listed under each phase), and Phases 1–2 got theirs on 2026-11-10.
+
+Acceptance for every phase: endpoints answer with the documented contract on local Postgres (one DB per region) + Redis + RabbitMQ, idempotency works, RBAC denies the right calls, and WebSocket clients receive **that phase's** events from [realtime.md §5](./business-logic/realtime.md#5-event-catalogue) (emitted after commit through `WsPublisher`).
 
 > **Parallel work on core-service.** This service depends on new core endpoints, permissions, an API-key guard and an outbox. Each phase lists its **core-service changes**. Don't start a phase until they exist (or develop against a stub with the same signature).
 
@@ -30,7 +32,7 @@ Goal: a runnable Express app with core's conventions plus country sharding, the 
 | Step | Files | Notes |
 |---|---|---|
 | Project | `package.json`, `tsconfig.json`, `.gitignore`, `.env.example` | core's stack and tsconfig (ESM `nodenext`); **add** `socket.io`, `@socket.io/redis-adapter`, `amqplib`, `amqp-connection-manager`. No bcrypt / mailjet. |
-| Config | `lib/config/env.ts` | zod; `REGIONS` + `DB_<region>_*` (required) + `ARCHIVE_DB_<region>_*` (optional until Phase 7), Redis, RabbitMQ, core, WS |
+| Config | `lib/config/env.ts` | zod; `REGIONS` + `DB_<region>_*` (required) + `ARCHIVE_DB_<region>_*` (optional until Phase 5), Redis, RabbitMQ, core, WS |
 | Shards | `lib/knex/{knex.ts, knexfile.ts, migrate-all.ts}` | `db(region)`, `dbArchive(region)`, `pingAll()`, `destroyAll()`; migrations loop every shard |
 | Region | `lib/sharding/{regions.ts, region-resolver.ts, errors.ts}` | `resolveRegion` (header only, invalid → 400), `requireRegion({ allowAll })` |
 | Errors / logging / correlation | `lib/error/*`, `lib/logger/logger.ts`, `lib/correlation/correlationId.ts` | core copies; correlation honours the incoming header |
@@ -78,7 +80,7 @@ Partitioning added on top of the plan: `orders` / `order_items` are monthly part
 **Core-service changes required:** seed `order:*` permissions; `restaurant_branches.delivery_fee`; internal endpoints (branch, restaurant, address, products batch, stock reserve/release, role permissions); publish the events above through the outbox.
 
 **Acceptance:**
-- COD order → `placed`, stock reserved on core (the `cod_collection` row comes with Phase 2), WS not yet (Phase 6).
+- COD order → `placed`, stock reserved on core (the `cod_collection` row comes with Phase 2).
 - `\d+ orders` shows monthly partitions + `orders_default`; `EXPLAIN` of Q-O1 touches one partition.
 - Online order → `pending_payment`.
 - Same `Idempotency-Key` + same body → same response; + different body → 409; with Redis flushed → still the same response (DB store).
@@ -91,9 +93,11 @@ Partitioning added on top of the plan: `orders` / `order_items` are monthly part
 - Fixed while testing: numeric query params (`limit`, `year`, `branchId`) always failed validation under `npm run dev`, because tsx (esbuild) doesn't emit decorator metadata, so `enableImplicitConversion` did nothing → explicit `@Type(() => Number)` in `order.request.dto.ts`. In core-service, `branch.service.ts` compared `restaurant.ownerId` (BIGINT → string) with `===` against the numeric JWT `userId`, so owners got 403 on `PATCH /branches/:id` → `Number(...) === Number(...)`.
 - Not covered (failure paths outside this list): stock running out between the pre-check and the reservation (`out_of_stock_post_commit`), and core unreachable during reservation (`stock_reservation_failed`).
 
+**Realtime (added 2026-11-10, `play/ws-e2e.ts`):** COD placement → `order.created` → `branch:<id>`, `restaurant:<id>`; every status change → `order.status_changed` → `customer:<id>`, `branch:<id>`; cancel / reject-void / payment timeout → `order.cancelled` → customer, branch, restaurant (with the reason). Emitted by `OrderEventsService` after commit.
+
 ---
 
-## Phase 2 — Payments
+## Phase 2 — Payments ✅ (implemented, tested 2026-11-09 — walkthrough + test guide: [phase-2-walkthrough.md](./phase-2-walkthrough.md))
 
 | # | Deliverable |
 |---|---|
@@ -112,101 +116,131 @@ Partitioning added on top of the plan: `orders` / `order_items` are monthly part
 - Unpaid order older than 15 min → `cancelled` by the sweep; a late success webhook → order stays cancelled + automatic refund.
 - Admin refund → `refund` `pending` → webhook → `succeeded`; refunding more than the charge → 409.
 
+
+**Test notes (2026-11-09):** `play/phase2-e2e.ts` against the running API: 32/32 checks passed — init (real Kashier sandbox session, reuse, idempotent replay, 409 on body mismatch, 404 for another customer), webhooks (401 bad signature with nothing stored, amount mismatch stored without state change, FAILURE, SUCCESS -> placed + captured + charge, duplicate, pay+capture of one transaction), `GET /payments/:id`, over-refund 409, admin refund sent to Kashier, auto refund on cancel of a paid order, late capture on a cancelled order -> stays cancelled + refund, refund sweep sending a never-sent refund, COD row + void. The sweep cancelled a real unpaid order at timeout + grace (`payment_timeout`). A **real** Kashier webhook (declined card) verified with our signature code and showed `amount: 70.5` -> `KASHIER_WEBHOOK_AMOUNT_UNIT=major` is right.
+- Fixed while testing: Kashier rejects `localhost` as `merchantRedirect` (400) -> `KASHIER_RETURN_URL` must be public; added the cosmetic `GET /payments/return` page.
+- Real sandbox, end to end: approved test-card payment (5123450000000008, expiry 06/25) -> real webhook -> order `placed`, session `captured`, charge `succeeded` with the real kashierOrderId; admin partial refund (100) -> 202 -> sent to Kashier (`PUT /v3/orders/:kashierOrderId`) -> real `refund` webhook (`amount: 1`) -> refund `succeeded`, matched by Kashier's refund transaction id. Kashier test mode: the card **expiry** picks the outcome (06/25 approved, 05/25 declined).
+- Not covered (failure paths outside this list): Kashier unreachable during `init` (503) and during a refund (row stays `pending`, stale-refund alert after 60 min).
+
+**Realtime (added 2026-11-10, `play/ws-e2e.ts`, 16/16):** captured → `payment.captured` → `customer:<id>` + `order.status_changed` (placed) + `order.created` → branch, restaurant; declined → `payment.failed` → `customer:<id>`; nothing reaches the restaurant while an order is `pending_payment`; a socket can't join another customer's room.
+
 ---
 
-## Phase 3 — Deliveries
+## Phase 3 — Deliveries & agents ✅ (implemented, tested 2026-11-10)
+
+Design: [business-logic/deliveries.md](./business-logic/deliveries.md). No `deliveries` table (ERD): delivery state on `orders`. **Agents choose their orders**: a worker offers `ready` orders over WebSocket to the nearest online agents, the first to accept gets it. No auto-assignment, no admin assignment.
 
 | # | Deliverable |
 |---|---|
-| 1 | Migrations: `create_deliveries_table`, `create_restaurant_balances_table`, `create_agent_earnings_table` (settlement writes both, so they land with it) |
-| 2 | `app/delivery/*`: enums, errors, entity, DTOs, repo (Q-D1..Q-D3), services (`delivery`, `assignment` incl. timeout scan, `settlement`), controller, routes |
-| 3 | Order `ready` → auto-assignment after commit; until Phase 4 the candidate source is the admin-provided `agentId` (manual assignment) |
-| 4 | Settlement in one trx: commission row + balance credit (`restaurant-balance.repo.ts` owned by `app/restaurant-finance/`, created now with `FinanceService.creditSettlement(trx, …)`) + `agent_earnings` (repo owned by `app/agent/`, created now with `AgentEarningService.record(trx, …)`) |
+| 1 | Migrations: `alter_orders_add_pickup_location` (`pickup_lat`, `pickup_lng`), `create_agent_earnings_table`, `create_restaurant_balances_table`. No presence table: presence and offers are Redis |
+| 2 | `src/worker.ts` (`npm run worker`): offer job every `OFFER_INTERVAL_SEC` (take back stale tasks, offer ready orders to the `OFFER_TOP_N` nearest online non-busy agents within `ASSIGNMENT_RADIUS_METERS` of the pickup, last seen ≤ 5 min, prune presence) + the existing sweeps moved out of the API. WS from the worker via `@socket.io/redis-emitter` |
+| 3 | `app/agent/*`: presence in Redis (online / ping / offline), available orders near the agent, tasks (Q-O6), earnings (Q-A3), `AgentEarningService.record(trx, …)` |
+| 4 | `app/delivery/*`: `OfferService` (used by the worker), accept (advisory lock + conditional `ready → assigned`), decline, `DeliveryStatusService` (picked / delivered / released), `SettlementService` |
+| 5 | `app/restaurant-finance/`: `restaurant-balance.repo.ts` + `FinanceService.creditSettlement(trx, …)` (credit only; reads/payouts in Phase 4) |
+| 6 | Orders: placement snapshots the branch `lat`/`lng` into `pickup_*`; cancelling a `ready` / `assigned` order withdraws offers / notifies the agent; new `UserClient` (agent name / phone, cached) |
+| 7 | Settlement on `delivered` in one trx: commission row + balance credit + COD `cod_collection` succeeded (or online charge check) + `agent_earnings` (80% of the delivery fee) |
 
-**Core-service changes required:** `GET /api/internal/users?ids=` (agent snapshots).
+**Core-service changes required:** none (`GET /api/internal/users?ids=` exists; branch `lat`/`lng`/`commission` exist — set a commission on the test branch).
 
-**Acceptance:**
-- An order marked `ready` gets a delivery for the nearest online agent; two concurrent assigners → one wins.
-- Agent rejects or doesn't answer in 30 s → reassigned; after 3 attempts → 409 + order back to `ready`.
-- `picked` / `delivered` mirror onto the order; only the assigned agent can move the delivery.
-- Delivering an order credits `subtotal − commission`, writes `commission` + `agent_earnings`; replaying `delivered` → 409, no double rows.
-
----
-
-## Phase 4 — Agents
-
-| # | Deliverable |
-|---|---|
-| 1 | Migration: `create_agent_presence_table` (+ `postgis`, GIST) |
-| 2 | `app/agent/*`: presence (online/offline/ping, Redis GEO + Postgres), tasks, earnings reads, reconciliation loop |
-| 3 | Assignment switches from its stub candidate source to `presence:geo` + the PostGIS fallback |
-
-**Core-service changes required:** `delivery_agent` users readable via the users endpoint.
+**Realtime (this phase):** `task.offered` (worker), `task.offer_withdrawn`, `task.cancelled` → `agent:<id>`; `order.status_changed` (assigned / picked / delivered / back to ready, with the agent's name + phone) → customer, branch; `delivery.position` → `customer:<id>` on pings while `picked`.
 
 **Acceptance:**
-- online → agent appears in `GEOSEARCH`; offline with a `picked` delivery → 409.
-- Agent silent for 90 s → reconciled offline.
-- Task list and earnings paginate and use Q-D1 / Q-A3.
-- Redis flushed → assignment still works through PostGIS.
+- A `ready` order is offered to the 3 nearest agents within 5 km of the branch who pinged in the last 5 min and aren't busy; an agent seen 6 min ago, 6 km away, busy, or who declined it never gets the offer.
+- Two agents accept the same order → one 200, one 409 `Order already taken`; the others get `task.offer_withdrawn`. One agent accepts two orders at once → one 409.
+- Nobody accepts → offered again after `OFFER_TTL_SEC` to whoever is nearest then.
+- `GET /agents/available-orders` lists the same nearby ready orders, nearest first.
+- Agent releases, or stops pinging while `assigned` → order back to `ready`, offered again, never to that agent.
+- Only the order's agent can move it; `picked` / `delivered` set `picked_at` / `delivered_at`.
+- `delivered` credits `subtotal − commission`, writes `commission` + `agent_earnings`, COD row `succeeded`; replaying `delivered` → 409, no double rows.
+- Offline with a `picked` order → 409; tasks and earnings paginate.
+- Worker restarted / two workers running → no duplicate assignment, no lost order. Redis flushed → offers resume after the next pings.
 
+
+**Test notes (2026-11-10):** `play/phase3-e2e.ts` against the running API + worker: **44/44** — offers to exactly the 3 nearest fresh agents (500 m / 1 km / 2 km; not the 4th at 3 km, not 8 km, not one last seen 6 min ago) with distance + cash-to-collect; the 3 km agent still sees it in `available-orders`, 8 km doesn't and can't accept (too far); two simultaneous accepts → one 200 + one 409, `task.offer_withdrawn` to the rest, customer gets `assigned` with the agent; one active order per agent; only the order's agent moves it; release → back to `ready`, re-offered (never to that agent); picked → `delivery.position` to the customer; offline while picked → 409; delivered → COD collected, commission row, balance `+ subtotal − commission`, earning = 80% of the fee; delivered again → 409 with one earning; online order settles with its charge; a silent agent's task is taken back by the worker (`task.cancelled`); cancelling a ready order withdraws its offers; tasks + earnings; offline releases an assigned order. Phase 2 (32/32) and realtime (16/16) suites still pass with the sweeps moved into the worker.
+- Background jobs moved from `server.ts` to `src/worker.ts` (`npm run worker`): **run both processes** from now on.
+- Non-zero commission: covered in Phase 4 (core got `PATCH /api/branches/:id/commission`, admin only).
 ---
 
-## Phase 5 — Restaurant finance
+## Phase 4 — Restaurant finance
 
 | # | Deliverable |
 |---|---|
 | 1 | No new migration (`restaurant_balances` landed in Phase 3) |
-| 2 | `app/restaurant-finance/*`: balance read, payouts list, admin `POST /restaurant/payouts`, `debitForRefund` (wired into the refund webhook) |
+| 2 | `app/restaurant-finance/*`: balance read, payouts list, admin `POST /restaurant/payouts`, `debitForRefund` (wired into the refund webhook — replaces the Phase 2 TODO) |
 
-**Core-service changes required:** none.
+**Core-service changes required:** `PATCH /api/branches/:id/commission { commissionBps }` (system admin, 0–10000, emits `branch.updated`) — decided 2026-11-18 so the platform can actually earn commission (see `core-service/CHANGES.md` §7).
+
+**Built (2026-11-18):**
+
+| # | Deliverable |
+|---|---|
+| 3 | `restaurant-finance/{errors,types,routes}.ts`, `dto/finance.request.dto.ts` + `finance.response.dto.ts`, `controller/finance.controller.ts`, `FinanceService` (`getBalance`, `listPayouts`, `recordPayout`, `debitForRefund`, `publishBalance`) |
+| 4 | `PaymentLedgerService`: `recordPayout`, `listPayouts` (Q-F2), `refundDebitContext` (Q-P3), `recordRefundDebit`; `settleDelivery` also returns already-succeeded refunds |
+| 5 | Refund webhook locks the **order row first** (`findOrderRefForRefundEvent` unlocked, then `findByRef(…, forUpdate)`), then the refund; debits if the order is `delivered` (replaces the TODO) |
+| 6 | Settlement takes back refunds that succeeded while the order was on its way (`refund-debit:<region>:settlement:<publicId>`) and emits `restaurant.balance_changed` |
+
+**Realtime (this phase):** `restaurant.balance_changed { currency, balance }` → `restaurant:<id>` after a settlement credit, a refund debit and a payout (owners watch the balance live). Settlement in Phase 3 starts emitting it once this phase adds the event.
 
 **Acceptance:**
 - Balance and payout list match the ledger for a restaurant with several delivered orders.
 - Payout larger than the balance → 409; same `Idempotency-Key` twice → one payout.
 - Refund after delivery debits the balance, never below 0 (remainder as `adjustment`).
+- The restaurant socket receives `restaurant.balance_changed` for each of the three.
+
+**Test notes (2026-11-18):** `play/phase4-e2e.ts` against core (API + worker) and order-service (API + worker): **35/36**.
+- Commission: owner can't set it, 20000 bps → 400, admin sets 1000 → 200. Two COD orders settle with commission = 10% of subtotal, balance `+= Σ(subtotal − commission)`, one `restaurant.balance_changed` each (last = DB balance).
+- Balance: owner = DB, branch manager 200, staff 403, customer 403, admin needs `?restaurantId` (400 without).
+- Payouts: > balance → 409, owner → 403, unknown restaurant → 404; 201, same `Idempotency-Key` twice → one row, balance −500 once, socket event, list newest first, bad range → 400.
+- Added 2026-11-19 (not run yet): replay after the Redis response expired → same payout from the ledger key, no 2nd row; two concurrent payouts that together exceed the balance → one 201 + one 409, balance −one payout.
+- Refund after delivery (signed refund webhook on a staged *sent* refund; the sandbox rejects test kashierOrderIds): balance −refund, `adjustment` succeeded owner → platform `refund-debit:eg:refund:<id>`, socket event, replay → no 2nd debit. The 2nd refund (rest of the charge) takes back only `share − first refund`: the delivery fee stays with the platform. Charge `is_refunded`.
+- Balance too low: debit stops at 0, `refund-shortfall:…` `pending` row for the remainder.
+- Refund confirmed while `picked`: balance untouched, taken back at delivery (`refund-debit:eg:settlement:<publicId>`).
+- Ledger: end − start = credits − payouts − refund debits for the run.
+- **Failed (environment):** `branch.updated` didn't reach order-service because RabbitMQ was not running (port 5672 closed, consumer never started). The test deleted the cached branch instead; the 60 s branch cache TTL is the fallback anyway. Re-run with RabbitMQ up.
+- Regression: ws 16/16, Phase 2 32/32, Phase 3 44/44.
+
+**Final run (2026-11-24): 39/39** with RabbitMQ up (docker container `rabbitmq`): `branch.updated` reaches order-service and drops the cached branch; both 2026-11-19 checks pass (ledger-key replay, concurrent payouts → one 201 + one 409). The consumer reconnected to RabbitMQ on its own (no API restart). **Phase 4 done.**
+- core-service's `npm run worker` runs `dist/worker.js` (needs a build); in dev use `npx tsx watch src/worker.ts`.
 
 ---
 
-## Phase 6 — WebSocket wiring
+## Phase 5 — Archival ✅ (2026-11-24)
+
+Design: [business-logic/archival.md](./business-logic/archival.md) (decisions D1–D10, approved 2026-11-24; D7 = separate process).
 
 | # | Deliverable |
 |---|---|
-| 1 | Services emit the events of [realtime.md §5](./business-logic/realtime.md#5-event-catalogue) after commit via `TOKENS.WsServer` |
-| 2 | `delivery.position` fan-out from presence pings |
-| 3 | Endpoint caches (`GET /restaurant/orders`, `GET /agents/tasks`) invalidated on the same transitions |
+| 1 | `ARCHIVE_DB_<region>_*` required; `npm run migrate:archive` applies all migrations to the archive clusters; migration `add_archival_indexes` (Q-X3, Q-X4) |
+| 2 | **`src/archiver.ts`** (`npm run archiver`, its own process; `npm run archive:once` = one pass) + `app/archival/`: per region under an advisory lock, inside the night window, batches of finished orders with `created_at < Jan 1` untouched for 30 days and no money pending → copy order + children to the archive in one archive trx (upsert) → verify identical rows → guarded delete from hot (lock, re-read, compare) → drop emptied month partitions. Payouts and webhook events move by date. |
+| 3 | Year-aware reads: a range touching a prior year reads archive + hot, merged with one cursor per source (customer / restaurant / admin orders, order detail, agent earnings, payouts, `GET /payments/:id`) |
 
 **Core-service changes required:** none.
 
-**Acceptance:** a branch dashboard socket receives `order.created` for a COD order and after a payment capture; the customer receives every status change; the agent receives `task.assigned` / `task.cancelled`; a socket can't subscribe to another user's room.
+**Realtime (this phase):** none, on purpose. Archiving moves prior-year, already-terminal orders between clusters; their state doesn't change, so there is nothing for a client to react to. (A separate process also has no sockets; progress goes to logs, not to customers.)
 
----
+**Acceptance:** prior-year orders disappear from hot and appear in archive with identical rows; `GET /customer/orders?year=<last year>` returns them; re-running the archiver is a no-op; balances untouched.
 
-## Phase 7 — Archival worker (the only separate process)
-
-| # | Deliverable |
-|---|---|
-| 1 | `ARCHIVE_DB_<region>_*` required; `npm run migrate:archive` applies all migrations to the archive clusters |
-| 2 | `src/worker.ts` + `lib/jobs/archival.worker.ts`: nightly per region, batches of orders with `created_at < Jan 1 of the current year` → copy order + children to archive in one archive trx → verify counts → delete from hot in one hot trx (children first); idempotent per batch (`ON CONFLICT DO NOTHING` on archive inserts) |
-| 3 | Year-aware reads: customer/restaurant/agent list and detail endpoints use `dbArchive(region)` for prior years |
-
-**Core-service changes required:** none.
-
-**Acceptance:** prior-year orders disappear from hot and appear in archive with identical rows; `GET /customer/orders?year=<last year>` returns them; re-running the worker is a no-op; balances untouched.
+**Test notes (2026-11-24):** `play/phase5-e2e.ts` against core (API) and order-service (API + worker), the archiver started by the suite: **38/38**, twice in a row.
+- Staging: 2025 month partitions created on hot; 8 real delivered orders of this year copied with every child row under new ids, 2025 UUIDv7 ids and 2025 timestamps; a 2025 payout and webhook event.
+- Race + lock: archiver paused between copy and delete (`ARCHIVE_TEST_PAUSE_MS`), a refund inserted meanwhile → the batch's delete rolled back, R still hot with the refund; a 2nd archiver at the same time → eg `skipped: locked`.
+- Move: A (online, refunded), B (COD), G (crash leftover with a stale archive copy → overwritten), R (with the late refund), F (pending shortfall) gone from hot, identical in the archive; C (sent refund pending), D (`ready`), E (touched 5 days ago) stay hot; payout + webhook event moved; 2025-03 / 2025-04 partitions dropped on hot, 2025-06 kept; stuck orders reported; balances untouched.
+- Reads: archived detail identical to before (payment summary included); `?year=2025` lists archived and hot orders across pages, each once, newest first; an order in both clusters shown once; restaurant orders / agent earnings / payouts over 2025 ranges; `GET /payments/:id` from the archive. Earnings totals count a row in both clusters twice until the next run (documented, checked).
+- Writes: status change and refund on an archived order → 404; late webhook → 200, `process_error = order archived`.
+- Idempotency: a 3rd run moves nothing and changes nothing.
+- Regression: ws 16/16, Phase 2 32/32, Phase 3 44/44, Phase 4 39/39.
 
 ---
 
 ## Build cadence
 
-| Phase | Depends on | Delivers |
-|---|---|---|
-| 0 | core: API key, outbox | runnable scaffold |
-| 1 | core: permissions, internal endpoints, events | orders end-to-end (COD) |
-| 2 | Kashier sandbox | online payments, refunds |
-| 3 | Phase 1–2 | assignment, delivery lifecycle |
-| 4 | Phase 3 | presence, tasks, earnings |
-| 5 | Phase 3–4 | balances, settlement, payouts |
-| 6 | Phase 1–5 | realtime events |
-| 7 | all | archive cluster + worker |
+| Phase | Depends on | Delivers | Realtime |
+|---|---|---|---|
+| 0 | core: API key, outbox | runnable scaffold, socket.io server | `hello`, rooms |
+| 1 ✅ | core: permissions, internal endpoints, events | orders end-to-end (COD) | `order.created`, `order.status_changed`, `order.cancelled` |
+| 2 ✅ | Kashier sandbox | online payments, refunds | `payment.captured`, `payment.failed` (+ order events) |
+| 3 ✅ | Phase 1–2 | offer worker, presence, accept, delivery lifecycle, settlement, earnings | `task.*`, delivery status, `delivery.position` |
+| 4 ✅ | Phase 3 | balances, payouts, refund debits | `restaurant.balance_changed` |
+| 5 ✅ | all | archive cluster + archiver process + year-aware reads | none (no state change) |
 
 ---
 

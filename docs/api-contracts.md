@@ -144,7 +144,7 @@ One repository call for the header + items + latest delivery + ledger rows (no N
 
 ### 1.3 `GET /api/customer/orders?year=YYYY`
 
-Auth: `customer`. `year` defaults to the current year; older years read the archive cluster (Phase 7). Pagination by `createdAt desc`.
+Auth: `customer`. `year` defaults to the current year; a prior year reads the archive **and** the hot cluster, merged, each order once (archival.md §6). Pagination by `createdAt desc`; the opaque cursor holds one position per source.
 
 **200** paginated `OrderSummaryResponseDTO[]`:
 
@@ -169,7 +169,7 @@ Auth: `rbac(order:order, read)` + `requireBranchAccess('branchId')`. Query: `bra
 
 ### 1.5 `GET /api/admin/orders` (fan-out)
 
-Auth: `admin`. `X-Region: all` allowed. Filters: `status`, `branchId`, `from`, `to`. **200** paginated `OrderSummaryResponseDTO[]` with a per-shard tagged cursor. Range defaults to Jan 1 of the current year → now and may not exceed one year (same for `/restaurant/orders`). `itemsCount` is the number of order lines.
+Auth: `admin`. `X-Region: all` allowed. Filters: `status`, `branchId`, `from`, `to`. **200** paginated `OrderSummaryResponseDTO[]` with a per-shard tagged cursor. Range defaults to Jan 1 of the current year → now and may not exceed one year (same for `/restaurant/orders`). A range that touches a prior year also reads the archive cluster (same for `/restaurant/orders`, `/agents/earnings`, `/restaurant/payouts`). `itemsCount` is the number of order lines.
 
 ### 1.6 `PATCH /api/orders/{publicId}/status` **(idem, strict)**
 
@@ -226,6 +226,10 @@ No auth; `provider ∈ {kashier}`; region comes from the payload's merchant orde
 
 **200** on success **and** on duplicates (Kashier stops retrying). 401 `Invalid signature`. 500 only if processing throws (Kashier retries; the stored event keeps `process_error`).
 
+### 2.2b `GET /api/payments/return`
+
+Browser landing page after Kashier's payment page (`KASHIER_RETURN_URL` may point here). No auth, returns a static HTML message, **reads nothing and changes nothing**: the query string is customer-controlled; the outcome comes from the webhook.
+
 ### 2.3 `GET /api/payments/{paymentId}`
 
 Auth: admin, or restaurant_user with `order:payment read` for their own restaurant's orders. `paymentId` = `transactions.id`.
@@ -267,91 +271,76 @@ Errors: 404 `Payment not found`, 409 `Payment is not refundable`, 409 `Refund ex
 
 ---
 
-## 3. Deliveries
+## 3. Deliveries & agents
 
-### 3.1 `POST /api/deliveries/assign/{orderPublicId}` **(idem)**
-
-Auth: admin (`order:delivery assign`). Without `agentId` the auto-assignment runs; with it, manual assignment.
+Phase 3, design: [business-logic/deliveries.md](./business-logic/deliveries.md). **Agents choose their orders**: the worker offers `ready` orders over WebSocket (`task.offered`), the agent accepts by REST; first accept wins. No auto-assignment, no admin assignment. Every endpoint: `requireRole(delivery_agent)` + `X-Region`; the agent is `req.user.userId`; orders are addressed by `orderPublicId`.
 
 ```ts
-class AssignDeliveryRequestDTO {
-    @IsOptional() @IsInt() @Min(1) agentId?: number;
-}
-```
-
-**201** `DeliveryResponseDTO`:
-
-```ts
-{
-    id: number;
+class AgentTaskResponseDTO {             // offers, available list, tasks, accept response
     orderPublicId: string;
-    agent: { id: number; name: string; phone: string | null };
-    status: DeliveryStatus;
-    pickup: { lat: number; lng: number };
-    dropoff: { lat: number; lng: number };
-    distanceMeters: number | null;
-    assignedAt: string;
-}
-```
-
-Errors: 409 `Order is not ready for delivery`, 409 `Order already has an active delivery`, 409 `No eligible agents`.
-
-### 3.2 `POST /api/deliveries/reassign/{orderPublicId}` **(idem)**
-
-Auth: admin. **201** `DeliveryResponseDTO` (the new row). Errors: 409 `Max reassignment attempts reached`, 409 `Order has no active delivery`.
-
-### 3.3 `PATCH /api/deliveries/{deliveryId}/status` **(idem)**
-
-Auth: the assigned `delivery_agent`.
-
-```ts
-class UpdateDeliveryStatusRequestDTO {
-    @IsIn(['accepted','rejected','picked','delivered'])
-    status!: 'accepted' | 'rejected' | 'picked' | 'delivered';
-
-    @IsOptional() @IsString() @MaxLength(500)
-    reason?: string;
-}
-```
-
-**200** `DeliveryStatusResponseDTO { id, status, updatedAt }`. Errors: 404 `Delivery not found`, 409 `Invalid status transition`.
-
----
-
-## 4. Agents
-
-All agent endpoints: `requireRole(delivery_agent)`; the agent is `req.user.userId`.
-
-| Endpoint | Body | 200 | Errors |
-|---|---|---|---|
-| `POST /api/agents/presence/online` | `PresenceRequestDTO { @IsLatitude() lat, @IsLongitude() lng }` | `{ online: true }` | — |
-| `POST /api/agents/presence/offline` | — | `{ online: false }` | 409 `Agent has an active delivery` |
-| `POST /api/agents/presence/ping` | `PresenceRequestDTO` | `{ online: true }` | 409 `Agent is not online` |
-| `GET /api/agents/tasks?status=` | — | paginated `DeliveryTaskResponseDTO[]` | — |
-| `GET /api/agents/earnings?from=&to=` | — | `AgentEarningsResponseDTO` | — |
-
-```ts
-class DeliveryTaskResponseDTO {
-    deliveryId: number;
-    orderPublicId: string;
-    status: DeliveryStatus;
-    pickup: { lat: number; lng: number };
+    status: OrderStatus;
+    pickup: { lat: number; lng: number } | null;
     dropoff: { lat: number; lng: number; addressText: string };
     itemsCount: number;
     total: number;
     currency: string;
     paymentMethod: 'online' | 'cod';
-    cashToCollect: number;               // total for COD, 0 for online
-    assignedAt: string;
+    cashToCollect: number;               // COD: total; online: 0
+    deliveryFee: number;
+    distanceMeters: number | null;       // agent -> pickup when known
+    assignedAt: string | null;
+    createdAt: string;
 }
+class DeliveryStatusResponseDTO { orderPublicId: string; status: OrderStatus; updatedAt: string }
+```
 
+### 3.1 `POST /api/deliveries/{orderPublicId}/accept` **(idem)**
+
+The agent takes a `ready` order. Must be online (pinged ≤ 5 min) and within `ASSIGNMENT_RADIUS_METERS` of the pickup; holds no other `assigned`/`picked` order. **200** `AgentTaskResponseDTO` (status `assigned`; repeating an accept you already won returns the same).
+
+Errors: 404 `Order not found`, 409 `Order already taken`, 409 `Order is not ready for delivery`, 409 `Agent is not online`, 409 `Agent is too far from the pickup`, 409 `Agent has an active delivery`.
+
+### 3.2 `POST /api/deliveries/{orderPublicId}/decline`
+
+The agent won't take this offer; it is never offered to them again. No order change. **204**. Errors: 404 `Order not found`.
+
+### 3.3 `PATCH /api/deliveries/{orderPublicId}/status` **(idem)**
+
+Only the order's current agent (anyone else → 404).
+
+```ts
+class UpdateDeliveryStatusRequestDTO {
+    @IsEnum(['picked','delivered','released']) status!: 'picked' | 'delivered' | 'released';
+    @IsOptional() @IsString() @MaxLength(500) reason?: string;      // for released
+}
+```
+
+`picked`: `assigned → picked`. `delivered`: `picked → delivered` + settlement (commission, balance, COD collected, agent earning) in one transaction. `released`: `assigned → ready` (offered to others, never again to this agent).
+**200** `DeliveryStatusResponseDTO`. Errors: 404 `Order not found`, 409 `Invalid status transition`, 409 `Order payment is not settled` (online order without a succeeded charge).
+
+---
+
+## 4. Agents
+
+| Endpoint | Body / query | 200 | Errors |
+|---|---|---|---|
+| `POST /api/agents/presence/online` | `PresenceRequestDTO { @IsLatitude() lat, @IsLongitude() lng }` | `{ online: true }` | — |
+| `POST /api/agents/presence/ping` | `PresenceRequestDTO` | `{ online: true }` | 409 `Agent is not online` |
+| `POST /api/agents/presence/offline` | — | `{ online: false }` (an `assigned` order is released) | 409 `Agent has an active delivery` (holding a `picked` order) |
+| `GET /api/agents/available-orders` | — | `AgentTaskResponseDTO[]`: ready orders within the radius of the last ping, nearest first, minus declined | 409 `Agent is not online` |
+| `GET /api/agents/tasks?status=&cursor=&limit=` | `status ∈ assigned, picked, delivered, cancelled` | paginated `AgentTaskResponseDTO[]` (this year, newest first) | 400 bad cursor |
+| `GET /api/agents/earnings?from=&to=&cursor=&limit=` | default: this month | `AgentEarningsResponseDTO` | 400 bad range / cursor |
+
+```ts
 class AgentEarningsResponseDTO {
     range: { from: string; to: string };
-    totals: { count: number; sum: number; currency: string };
-    items: Array<{ orderPublicId: string; amount: number; currency: string; earnedAt: string }>;
+    totals: Array<{ count: number; sum: number; currency: string }>;
+    items: Array<{ orderPublicId: string | null; amount: number; currency: string; earnedAt: string }>;
     nextCursor: string | null;
 }
 ```
+
+Clients ping every ~30 s while online. Presence lives in Redis only (no table).
 
 ---
 
@@ -359,13 +348,13 @@ class AgentEarningsResponseDTO {
 
 ### 5.1 `GET /api/restaurant/balance`
 
-Auth: `rbac(order:finance, read)`; restaurant from the JWT. Not cached (must be fresh).
+Auth: `rbac(order:finance, read)`; restaurant from the JWT; admins pass `?restaurantId=` (400 without). Not cached (must be fresh).
 
 **200** `RestaurantBalanceResponseDTO { restaurantId, balances: [{ currency, balance }], asOf }`.
 
 ### 5.2 `GET /api/restaurant/payouts?from=&to=`
 
-Auth: `rbac(order:finance, read)`. Defaults: last 90 days. **200** paginated `PayoutResponseDTO[]`:
+Auth: `rbac(order:finance, read)` (admins: `?restaurantId=`). Defaults: last 90 days, max one year, `cursor` + `limit` (≤ 100). **200** paginated `PayoutResponseDTO[]`:
 
 ```ts
 { id: number; amount: number; currency: string; status: 'pending' | 'succeeded' | 'failed' | 'reversed';
@@ -386,7 +375,9 @@ class CreatePayoutRequestDTO {
 }
 ```
 
-**201** `PayoutResponseDTO`. Errors: 404 `Restaurant not found`, 409 `Insufficient balance`.
+**201** `PayoutResponseDTO`. Errors: 404 `Restaurant not found`, 409 `Insufficient balance`. A replay with the same `Idempotency-Key` returns the same payout (Redis 24 h, then `transactions.idempotency_key = payout:<hash>`).
+
+Every balance change emits `restaurant.balance_changed { currency, balance }` → `restaurant:<id>` (settlement credit, refund debit, payout).
 
 ---
 
@@ -436,7 +427,9 @@ Payloads are response DTOs or documented subsets, e.g. `order.status_changed = {
 
 ## 7. Health
 
-`GET /api/health` — no auth, no region. **200** `{ status: "ok", shards: [{ region, ok }] }` when every hot shard answers, **503** `{ status: "error", shards: [...] }` otherwise. Archive shards are not checked (they may not exist before Phase 7).
+`GET /api/health` — no auth, no region. **200** `{ status: "ok", shards: [{ region, ok }], archiveShards: [{ region, ok }] }` when every hot shard answers, **503** `{ status: "error", … }` otherwise. Archive shards are reported but never fail the check: when one is down, only prior-year reads fail.
+
+**Archived orders (Phase 5):** `GET /orders/:publicId` and `GET /payments/:id` find them in the archive. Writes go to hot only, so a status change, delivery action or refund on an archived order gets the existing **404** (`Order not found` / `Payment not found`). A late Kashier webhook for an archived order is acknowledged with **200** and recorded with `process_error = "order archived"`.
 
 ---
 
@@ -495,16 +488,15 @@ Every message is an `AppError` constant in a module's `errors.ts` (core style). 
 | `Invalid signature` | 401 | payments |
 | `Payment provider unavailable` | 503 | payments |
 | `Payment provider rejected the request` | 502 | payments |
-| `Delivery not found` | 404 | deliveries |
+| `Order payment is not settled` | 409 | payments (delivery settlement) |
+| `Order already taken` | 409 | deliveries |
 | `Order is not ready for delivery` | 409 | deliveries |
-| `Order already has an active delivery` | 409 | deliveries |
-| `Order has no active delivery` | 409 | deliveries |
-| `No eligible agents` | 409 | deliveries |
-| `Max reassignment attempts reached` | 409 | deliveries |
-| `Agent has an active delivery` | 409 | agents |
-| `Agent is not online` | 409 | agents |
+| `Agent is too far from the pickup` | 409 | deliveries |
+| `Agent has an active delivery` | 409 | deliveries, agents |
+| `Agent is not online` | 409 | deliveries, agents |
 | `Restaurant not found` | 404 | finance |
 | `Insufficient balance` | 409 | finance |
+| `Validation failed: restaurantId is required` | 400 | finance (admin reads) |
 
 ---
 

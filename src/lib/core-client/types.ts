@@ -46,6 +46,13 @@ export interface CoreBranchProduct {
     isAvailable: boolean;
 }
 
+// GET /api/internal/users?ids= (agent snapshots)
+export interface CoreUserContact {
+    id: number;
+    name: string;
+    phone: string | null;
+}
+
 export interface CoreStockItem {
     productId: number;
     quantity: number;

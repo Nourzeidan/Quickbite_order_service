@@ -1,6 +1,6 @@
 # Realtime Module (WebSocket)
 
-Code: `src/lib/websocket/` (scaffold, Phase 0). Event wiring into services: Phase 6. Protocol: [api-contracts §6](../api-contracts.md#6-websocket-socketio).
+Code: `src/lib/websocket/` (server: Phase 0; `WsPublisher`). **Each phase emits its own events** (there is no separate wiring phase): Orders + Payments since 2026-11-10 (`OrderEventsService`, `WebhookService`), Deliveries & agents in Phase 3, finance in Phase 4. The offer worker (a separate process) emits through `@socket.io/redis-emitter` into the same Redis channel. Protocol: [api-contracts §6](../api-contracts.md#6-websocket-socketio).
 
 ## 1. Goals
 
@@ -31,14 +31,15 @@ Why socket.io and not raw `ws` or SSE: rooms + the Redis adapter give cross-inst
 
 JWT expiry: the socket keeps its rooms until it disconnects; clients reconnect with a fresh token after a refresh.
 
-## 4. Publishing (Phase 6)
+## 4. Publishing
 
 ```ts
-// in a service, AFTER trx.commit()
-const io = container.resolve<Server>(TOKENS.WsServer);
-io.to(`customer:${order.customerId}`).to(`branch:${order.branchId}`)
-  .emit("order.status_changed", { orderPublicId: order.publicId, status: order.status, updatedAt });
+// in a service, AFTER trx.commit() — WsPublisher is injected (TOKENS.WsPublisher)
+this.ws.publish([Rooms.customer(order.customerId), Rooms.branch(order.branchId)],
+    "order.status_changed", {orderPublicId: order.publicId, status: order.status, updatedAt});
 ```
+
+The socket.io server needs the http server, which exists only after the DI container, so `server.ts` binds it: `container.resolve<WsPublisher>(TOKENS.WsPublisher).bind(io)`. Scripts without a server just drop emits.
 
 Rules:
 
@@ -55,10 +56,12 @@ Rules:
 | `order.cancelled` | `customer:<id>`, `branch:<id>`, `restaurant:<id>` | `{ orderPublicId, reason, updatedAt }` | Orders, payment sweep |
 | `payment.captured` | `customer:<id>` | `{ orderPublicId, amount, currency }` | Payments |
 | `payment.failed` | `customer:<id>` | `{ orderPublicId, reason }` | Payments |
-| `delivery.status_changed` | `customer:<id>`, `branch:<id>` | `{ orderPublicId, status, updatedAt, agent }` | Deliveries |
-| `delivery.position` | `customer:<id>` | `{ deliveryId, lat, lng, ts }` | Agents (ping while `picked`) |
-| `task.assigned` | `agent:<id>` | `DeliveryTaskResponseDTO` | Deliveries |
-| `task.cancelled` | `agent:<id>` | `{ deliveryId, reason }` | Deliveries, Orders |
+| `order.status_changed` (delivery) | `customer:<id>`, `branch:<id>` | `{ orderPublicId, status, updatedAt, agent: {id, name, phone} \| null }` | Deliveries (Phase 3) |
+| `delivery.position` | `customer:<id>` | `{ orderPublicId, lat, lng, ts }` | Agents (ping while `picked`, Phase 3) |
+| `task.offered` | `agent:<id>` | `AgentTaskResponseDTO` + `distanceMeters` | offer worker (Phase 3) |
+| `task.offer_withdrawn` | `agent:<id>` | `{ orderPublicId, reason }` | Deliveries (Phase 3) |
+| `task.cancelled` | `agent:<id>` | `{ orderPublicId, reason }` | Deliveries, Orders (Phase 3) |
+| `restaurant.balance_changed` | `restaurant:<id>` | `{ currency, balance }` | Finance (Phase 4) |
 
 ## 6. Delivery guarantees
 

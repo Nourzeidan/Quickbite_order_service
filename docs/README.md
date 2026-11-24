@@ -13,12 +13,16 @@
 | 5 | [integrations.md](./integrations.md) | core-service sync HTTP + inbound RabbitMQ events, Kashier v3 |
 | 6 | [business-logic/orders.md](./business-logic/orders.md) | Placement algorithm, pricing, status machine, cancellation, reads |
 | 7 | [business-logic/payments.md](./business-logic/payments.md) | Kashier sessions, webhooks, refunds, COD |
-| 8 | [business-logic/deliveries.md](./business-logic/deliveries.md) | Assignment algorithm, delivery status machine, settlement on delivered, reassignment |
-| 9 | [business-logic/agents.md](./business-logic/agents.md) | Presence model, task list, earnings |
+| 8 | [business-logic/deliveries.md](./business-logic/deliveries.md) | Deliveries & agents: offer worker, accept, presence (Redis), delivery status, settlement, earnings |
+| 9 | [business-logic/agents.md](./business-logic/agents.md) | Pointer: agents are part of deliveries.md (Phase 3) |
 | 10 | [business-logic/restaurant-finance.md](./business-logic/restaurant-finance.md) | Balance and payout reads, admin payout recording |
 | 11 | [business-logic/rbac.md](./business-logic/rbac.md) | Permissions seeded in core, per-endpoint mapping, cached resolution |
 | 12 | [business-logic/realtime.md](./business-logic/realtime.md) | socket.io server, rooms, events, emit-after-commit |
 | 13 | [implementation-plan.md](./implementation-plan.md) | Phase-by-phase build order with acceptance gates and the PR checklist |
+| 0 | [session-handoff.md](./session-handoff.md) | **Start here when resuming**: status, how to run, decisions, open items, next phase |
+| 14 | [phase-2-walkthrough.md](./phase-2-walkthrough.md) | How Kashier works, what the Phase 2 code does and why, deviations from the docs, open items |
+| 15 | [phase-4-walkthrough.md](./phase-4-walkthrough.md) | Restaurant finance: credits, refund debits, payouts, file by file |
+| 16 | [phase-5-walkthrough.md](./phase-5-walkthrough.md) | Archival: the archiver process, copy → verify → guarded delete, **the locks explained**, **why order ids are UUIDv7**, merged prior-year reads, tests |
 
 The project-wide rules for contributors (human or AI) live in [`../CLAUDE.md`](../CLAUDE.md).
 
@@ -56,8 +60,10 @@ The project-wide rules for contributors (human or AI) live in [`../CLAUDE.md`](.
 | Stock | Sync check at placement, `reserveStock` on core right after commit; order voided if the reservation fails | orders §2 |
 | Online payments | Kashier v3 Payment Sessions + HMAC-verified webhooks; order moves to `placed` only on a verified capture | payments |
 | Realtime | socket.io on `/ws`, `@socket.io/redis-adapter`, rooms = channels, emit after commit | realtime |
-| Archival | Separate `order_service_archive` cluster per region, nightly worker (Phase 7) | system-design §10 |
+| Archival | Separate `order_service_archive_<region>` cluster per region; the archiver process (`npm run archiver`) moves prior-year finished orders nightly; prior-year reads merge archive + hot (Phase 5) | business-logic/archival.md, system-design §10 |
 | Transactions | Explicit `trx` + commit/rollback (core `auth.service.ts` style) | folder-structure §3.5 |
 | Permission names | `order:<resource>` + action, matching core's `core:<resource>` naming | rbac |
 | Admin role | core's `admin` system role (the example's `system_admin` does not exist in core) | rbac |
-| Background loops | In-process timers: payment-expiry sweep (Phase 2), assignment timeout scan (Phase 3), presence reconciliation (Phase 4); archival worker is a separate process (Phase 7) | system-design §2 |
+| Background jobs | One worker process (`src/worker.ts`, `npm run worker`): delivery offers every 10 s (Phase 3), payment / refund sweep (Phase 2), partitions, idempotency cleanup; archival runs in its own process (`src/archiver.ts`). The API process only serves requests | system-design §2 |
+| Deliveries | No `deliveries` table (ERD): delivery state on `orders`; agents **choose** orders offered over WebSocket (first accept wins); presence in Redis only | deliveries.md |
+| Realtime | Each phase emits its own events (no separate WebSocket phase) | realtime.md |
